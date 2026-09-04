@@ -1,0 +1,12 @@
+mss
+Pillow
+pyautogui
+pynput
+requests
+python-dotenv
+SpeechRecognition
+pyttsx3
+pyaudio
+pytesseract
+keyboard
+comtypes
