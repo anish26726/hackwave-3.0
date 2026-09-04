@@ -153,6 +153,97 @@ def ask_uitars(task: str, screenshot_b64: str, history: list[dict] | None = None
     return None
 
 
+# ── Screen description (Phase 4) ───────────────────────────────────────────
+
+READ_SCREEN_PROMPT = """You are AccessOS, a Windows screen reader for visually impaired users.
+You receive a screenshot. Describe the visible content clearly and concisely so it can be read aloud.
+
+RULES:
+1. Identify the active application/window first.
+2. Read the main content in logical order (top-to-bottom, left-to-right).
+3. For web pages: title, main heading, main content, important links or buttons.
+4. For documents/PDFs: heading, visible text, page number if shown.
+5. For apps/dialogs: window title, labels, field values, buttons, any error messages.
+6. If there is an error or warning dialog, read the EXACT error message.
+7. Mention important interactive elements (buttons, checkboxes, links) but skip decorative icons.
+8. Do NOT suggest actions. Just describe what is visible.
+9. Keep the output under 200 words. Be concise and natural — it will be spoken aloud."""
+
+
+def describe_screen(screenshot_b64: str, user_query: str = "Read the screen") -> Optional[str]:
+    """
+    Ask UI-TARS to describe the current screen for reading purposes.
+
+    Uses READ_SCREEN_PROMPT (describe mode) instead of SYSTEM_PROMPT (action mode).
+
+    Args:
+        screenshot_b64: Base64-encoded JPEG of the current screen.
+        user_query:     What the user asked (used to focus the description).
+
+    Returns:
+        Plain text description suitable for TTS, or None on failure.
+    """
+    url = f"{FEATHERLESS_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {get_api_key()}",
+        "Content-Type": "application/json",
+    }
+    messages = [
+        {"role": "system", "content": READ_SCREEN_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        f"User request: \"{user_query}\"\n"
+                        "Please describe what is visible on this screen."
+                    ),
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"},
+                },
+            ],
+        },
+    ]
+    payload = {
+        "model": FEATHERLESS_MODEL,
+        "messages": messages,
+        "max_tokens": 400,
+        "temperature": 0.2,
+    }
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                url, headers=headers, json=payload, timeout=API_TIMEOUT_SECONDS
+            )
+            response.raise_for_status()
+            data = response.json()
+            desc = data["choices"][0]["message"]["content"].strip()
+            print(f"[brain] Screen description: {desc[:100]}...")
+            return desc
+        except requests.exceptions.Timeout:
+            last_error = TimeoutError(f"API timed out after {API_TIMEOUT_SECONDS}s")
+        except requests.exceptions.HTTPError as e:
+            last_error = e
+            if response.status_code != 429 and response.status_code < 500:
+                print(f"[brain] describe_screen API error {response.status_code}")
+                return None
+        except Exception as e:
+            last_error = e
+
+        if attempt < MAX_RETRIES:
+            wait = 2 ** attempt
+            print(f"[brain] describe_screen attempt {attempt} failed. Retrying in {wait}s…")
+            time.sleep(wait)
+
+    print(f"[brain] describe_screen failed after {MAX_RETRIES} attempts: {last_error}")
+    return None
+
+
 # ── Action parser ──────────────────────────────────────────────────────────
 
 # Allowed action types — no shell, no eval, no exec

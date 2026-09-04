@@ -1,10 +1,12 @@
-# AccessOS -- Main Entry Point (Phase 3)
+# AccessOS -- Main Entry Point (Phase 4)
 # Core loop:
 #   Text input  -> Screenshot -> UI-TARS -> Validate -> Safety Check
 #   -> Execute  -> Verify -> Anti-repetition -> Repeat
 #
 # Voice mode (Phase 3):
 #   Wake word -> STT -> run_task() -> TTS response
+# Screen reader (Phase 4):
+#   Read command -> Screenshot -> OCR + UI-TARS -> Organised text -> TTS
 # Safety confirmations will be enhanced in Phase 8.
 
 import sys
@@ -27,6 +29,16 @@ try:
 except Exception as _ve:
     _VOICE_AVAILABLE = False
     print(f"[main] Voice modules unavailable: {_ve}")
+
+# -- Phase 4: Screen reader ---------------------------------------------------
+try:
+    from screen.reader import get_reader, is_screen_read_command
+    from PIL import Image
+    import io, base64
+    _READER_AVAILABLE = True
+except Exception as _re:
+    _READER_AVAILABLE = False
+    print(f"[main] Screen reader unavailable: {_re}")
 
 # -- Emergency stop --------------------------------------------------------
 # Moving the mouse to the top-left corner triggers pyautogui.FailSafeException
@@ -221,6 +233,63 @@ def run_task(task: str) -> str:
     return "Reached maximum action limit ({}). Task stopped.".format(MAX_ACTIONS_PER_TASK)
 
 
+# -- Screen reader (Phase 4) --------------------------------------------------
+
+def run_screen_reader(task: str, tts=None) -> str:
+    """
+    Capture the current screen and return an organised text description.
+    Speaks the result aloud if a TTS instance is provided.
+
+    Pipeline:
+        Screenshot → OCR + Win32 accessibility → UI-TARS vision → TTS
+
+    Args:
+        task: The user's read/describe request.
+        tts:  Optional TTS instance for voice output.
+
+    Returns:
+        Human-readable screen description string.
+    """
+    if not _READER_AVAILABLE:
+        msg = "Screen reader is not available."
+        if tts:
+            tts.speak(msg)
+        return msg
+
+    print("[reader] Capturing screen for reading...")
+    try:
+        screenshot_b64 = capture_screen()
+    except RuntimeError as e:
+        msg = f"Screenshot failed: {e}"
+        if tts:
+            tts.speak(msg)
+        return msg
+
+    # Decode b64 → PIL Image for OCR
+    try:
+        raw_bytes = base64.b64decode(screenshot_b64)
+        screenshot_pil = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    except Exception as e:
+        screenshot_pil = None
+        print(f"[reader] Could not decode screenshot for OCR: {e}")
+
+    reader = get_reader()
+    description = reader.read(
+        screenshot_pil=screenshot_pil,
+        screenshot_b64=screenshot_b64,
+        user_query=task,
+    )
+
+    print(f"\n[reader] Screen content:\n{description}\n")
+
+    if tts:
+        # Offline Windows TTS (pyttsx3) handles long text natively.
+        # Calling speak() in a loop breaks the engine loop, so we pass it whole.
+        tts.speak(description)
+
+    return description
+
+
 # -- Voice mode ---------------------------------------------------------------
 
 def run_voice_mode() -> None:
@@ -277,13 +346,17 @@ def run_voice_mode() -> None:
             # Step 4 — Confirm command back to user
             tts.speak_async(f"Running: {command}")
 
-            # Step 5 — Execute via the same run_task() loop
+            # Step 5 — Route to screen reader or action loop
             try:
-                result = run_task(command)
-                print(f"[Voice] Result: {result}")
-                # Trim long results for TTS
-                spoken = result if len(result) <= 120 else result[:120] + "."
-                tts.speak(spoken)
+                # Screen reading commands → reader (Phase 4)
+                if _READER_AVAILABLE and is_screen_read_command(command):
+                    run_screen_reader(command, tts=tts)
+                else:
+                    # Action commands → UI-TARS executor loop
+                    result = run_task(command)
+                    print(f"[Voice] Result: {result}")
+                    spoken = result if len(result) <= 120 else result[:120] + "."
+                    tts.speak(spoken)
             except pyautogui.FailSafeException:
                 tts.speak("Emergency stop triggered.")
                 break
@@ -303,13 +376,13 @@ def main():
     voice_mode = "--voice" in sys.argv
 
     print("=" * 60)
-    print("  AccessOS -- AI Computer-Use Agent (Phase 3)")
+    print("  AccessOS -- AI Computer-Use Agent (Phase 4)")
     print("  Model: UI-TARS-1.5-7B via Featherless")
     print("  Emergency Stop: move mouse to top-left corner")
     if voice_mode:
         print("  Mode: VOICE (wake word: 'Hey Access')")
     else:
-        print("  Mode: TEXT  (type 'voice' to switch to voice mode)")
+        print("  Mode: TEXT  (type 'voice' to switch, 'read' to read screen)")
     print("  Type 'quit' or 'exit' to close.")
     print("=" * 60)
 
@@ -348,6 +421,13 @@ def main():
         # Switch to voice mode on demand
         if task.lower() == "voice":
             run_voice_mode()
+            continue
+
+        # Route screen-reading commands to the screen reader (Phase 4)
+        if _READER_AVAILABLE and is_screen_read_command(task):
+            tts_instance = TTS() if _VOICE_AVAILABLE else None
+            result = run_screen_reader(task, tts=tts_instance)
+            print("\n[AccessOS] Screen read complete.\n")
             continue
 
         result = run_task(task)

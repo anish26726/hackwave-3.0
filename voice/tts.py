@@ -1,74 +1,94 @@
 # AccessOS — Text-to-Speech (TTS)
-# Uses pyttsx3 for fully offline Windows SAPI voices.
-# This module is designed to be swapped out for another TTS provider easily.
+# Uses Windows SAPI directly via comtypes, bypassing pyttsx3 entirely.
+# This completely eliminates threading and event loop crashes.
 
 import threading
 from typing import Optional
 
 try:
-    import pyttsx3
-    _PYTTSX3_AVAILABLE = True
+    import comtypes.client
+    _SAPI_AVAILABLE = True
 except ImportError:
-    _PYTTSX3_AVAILABLE = False
+    _SAPI_AVAILABLE = False
 
 
 class TTS:
     """
-    Text-to-Speech engine wrapping pyttsx3 (Windows SAPI, fully offline).
-
-    Usage:
-        tts = TTS()
-        tts.speak("Calculator is now open.")
+    Text-to-Speech engine wrapping Windows SAPI.
     """
 
-    def __init__(self, rate: int = 170, volume: float = 0.95):
-        self._engine = None
+    def __init__(self, rate: int = 2, volume: int = 95):
         self._rate = rate
         self._volume = volume
-        self._lock = threading.Lock()
-        self._init_engine()
+        self._available = _SAPI_AVAILABLE
 
-    def _init_engine(self):
-        if not _PYTTSX3_AVAILABLE:
-            print("[TTS] pyttsx3 not installed. Voice output disabled.")
+        if not self._available:
+            print("[TTS] comtypes not installed. Voice output disabled.")
             return
+
+        # We initialize COM for the main thread just in case.
+        # But we create the speaker object per-thread when speak is called.
         try:
-            self._engine = pyttsx3.init()
-            self._engine.setProperty("rate", self._rate)
-            self._engine.setProperty("volume", self._volume)
-            # Prefer a female voice if available (purely aesthetic)
-            voices = self._engine.getProperty("voices")
-            for v in voices:
-                if "zira" in v.name.lower() or "female" in v.name.lower():
-                    self._engine.setProperty("voice", v.id)
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+
+    def _get_speaker(self):
+        """Creates a fresh SpVoice object for the current thread."""
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+            speaker = comtypes.client.CreateObject("SAPI.SpVoice")
+            speaker.Rate = self._rate
+            speaker.Volume = self._volume
+            
+            # Prefer Zira (female) if available
+            voices = speaker.GetVoices()
+            for i in range(voices.Count):
+                name = voices.Item(i).GetDescription()
+                if "Zira" in name or "female" in name.lower():
+                    speaker.Voice = voices.Item(i)
                     break
+            return speaker
         except Exception as e:
-            print(f"[TTS] Engine init failed: {e}")
-            self._engine = None
+            print(f"[TTS] SAPI initialization failed: {e}")
+            return None
 
     def speak(self, text: str) -> None:
-        """
-        Speak *text* synchronously (blocks until audio finishes).
-        Prints the text regardless so text-mode users see the response.
-        """
+        """Speak synchronously."""
         print(f"[TTS] {text}")
-        if not self._engine:
+        if not self._available:
             return
-        try:
-            with self._lock:
-                self._engine.say(text)
-                self._engine.runAndWait()
-        except Exception as e:
-            print(f"[TTS] Speak error: {e}")
+            
+        speaker = self._get_speaker()
+        if speaker:
+            try:
+                # Speak synchronously
+                speaker.Speak(text)
+            except Exception as e:
+                print(f"[TTS] Speak error: {e}")
 
     def speak_async(self, text: str) -> None:
-        """Speak *text* in a daemon thread so the main loop is not blocked."""
-        t = threading.Thread(target=self.speak, args=(text,), daemon=True)
+        """Speak asynchronously in a background thread."""
+        print(f"[TTS] {text}")
+        if not self._available:
+            return
+        
+        t = threading.Thread(target=self._speak_thread, args=(text,), daemon=True)
         t.start()
+
+    def _speak_thread(self, text: str) -> None:
+        speaker = self._get_speaker()
+        if speaker:
+            try:
+                speaker.Speak(text)
+            except Exception as e:
+                print(f"[TTS] Async speak error: {e}")
 
     @property
     def available(self) -> bool:
-        return self._engine is not None
+        return self._available
 
 
 # Module-level singleton — import and use directly if preferred.
