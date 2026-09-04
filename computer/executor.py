@@ -3,6 +3,7 @@
 # Uses pyautogui (mouse/keyboard) and controlled app-launching via the Win32
 # shell API — NO subprocess, shell, eval, exec, or os.system.
 
+import os
 import time
 import pyautogui
 
@@ -21,13 +22,26 @@ pyautogui.PAUSE = 0.05  # Small pause between pyautogui calls for stability
 
 # ── Application allow-list ─────────────────────────────────────────────────
 # Maps friendly names to their Windows executable paths / commands.
-# The model can only launch apps from this list — not arbitrary executables.
-APP_ALLOW_LIST: dict[str, str] = {
-    "chrome":          r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    "google chrome":   r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    "firefox":         r"C:\Program Files\Mozilla Firefox\firefox.exe",
-    "edge":            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    "microsoft edge":  r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+# Paths are resolved at call time via os.path.expandvars() so that
+# %USERNAME%, %LOCALAPPDATA%, etc. are substituted correctly.
+# Multiple candidate paths can be given as a list; the first that exists wins.
+APP_ALLOW_LIST: dict[str, object] = {
+    "chrome": [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+    ],
+    "google chrome": [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe",
+    ],
+    "firefox": [
+        r"C:\Program Files\Mozilla Firefox\firefox.exe",
+        r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe",
+    ],
+    "edge":           r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    "microsoft edge": r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
     "notepad":         "notepad.exe",
     "word":            r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
     "excel":           r"C:\Program Files\Microsoft Office\root\Office16\EXCEL.EXE",
@@ -39,8 +53,14 @@ APP_ALLOW_LIST: dict[str, str] = {
     "settings":        "ms-settings:",
     "cmd":             "cmd.exe",           # Controlled launch only
     "terminal":        "wt.exe",
-    "vs code":         r"C:\Users\%USERNAME%\AppData\Local\Programs\Microsoft VS Code\Code.exe",
-    "vscode":          r"C:\Users\%USERNAME%\AppData\Local\Programs\Microsoft VS Code\Code.exe",
+    "vs code": [
+        r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe",
+        r"C:\Program Files\Microsoft VS Code\Code.exe",
+    ],
+    "vscode": [
+        r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe",
+        r"C:\Program Files\Microsoft VS Code\Code.exe",
+    ],
 }
 
 
@@ -77,7 +97,11 @@ def execute_action(action: dict) -> str:
                 return f"Moved mouse to ({x_px}, {y_px})"
 
         elif action_type == "scroll":
-            x_px, y_px = _percent_to_px(action["point"], screen_w, screen_h)
+            # point is optional — default to screen centre if omitted.
+            if "point" in action:
+                x_px, y_px = _percent_to_px(action["point"], screen_w, screen_h)
+            else:
+                x_px, y_px = screen_w // 2, screen_h // 2
             direction = action.get("direction", "down")
             amount = int(action.get("amount", 3))
             clicks = amount if direction in ("up", "left") else -amount
@@ -99,7 +123,9 @@ def execute_action(action: dict) -> str:
             return f"Pressed key: {key}"
 
         elif action_type == "hotkey":
-            keys = [k.strip().lower() for k in action["keys"].split("+")]
+            # Accept 'keys' field (preferred) or 'key' as fallback.
+            keys_raw = action.get("keys") or action.get("key", "")
+            keys = [k.strip().lower() for k in keys_raw.split("+") if k.strip()]
             pyautogui.hotkey(*keys)
             return f"Hotkey: {'+'.join(keys)}"
 
@@ -140,23 +166,41 @@ def _open_app(name: str) -> str:
     """
     Open an application by friendly name using the controlled allow-list.
     Uses the Windows shell to open the app — NOT arbitrary subprocess calls.
+
+    APP_ALLOW_LIST values may be a single path string or a list of candidate
+    paths; the first candidate that exists on disk is used.
     """
     key = name.strip().lower()
-    path = APP_ALLOW_LIST.get(key)
-    if not path:
+    entry = APP_ALLOW_LIST.get(key)
+    if not entry:
         # Try partial match
-        for app_name, app_path in APP_ALLOW_LIST.items():
+        for app_name, app_entry in APP_ALLOW_LIST.items():
             if key in app_name or app_name in key:
-                path = app_path
+                entry = app_entry
                 break
 
-    if not path:
+    if not entry:
         return f"App {name!r} not in allow-list. Cannot open."
 
+    # Resolve a single path string or iterate through a list of candidates.
+    candidates = entry if isinstance(entry, list) else [entry]
+    path = None
+    for candidate in candidates:
+        resolved = os.path.expandvars(candidate)
+        # ms-settings: and similar URI schemes don't exist as files — use them directly.
+        if ":" in resolved and not resolved.endswith(".exe"):
+            path = resolved
+            break
+        if os.path.isfile(resolved):
+            path = resolved
+            break
+
+    if not path:
+        # Last resort: try the first candidate anyway (system PATH executables like notepad.exe)
+        path = os.path.expandvars(candidates[0])
+
     try:
-        # Use os.startfile equivalent via the shell — NOT executing user-supplied commands
-        import os
-        os.startfile(os.path.expandvars(path))
+        os.startfile(path)
         time.sleep(1.5)  # Give the app time to open
         return f"Opened: {name}"
     except Exception as e:

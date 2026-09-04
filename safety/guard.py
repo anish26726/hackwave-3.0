@@ -33,13 +33,25 @@ def is_sensitive(action: dict) -> tuple[bool, str]:
     """
     action_type = action.get("type", "")
 
+    # These action types are never sensitive — skip keyword scan entirely.
+    # Avoids false positives where done(message="file removed") triggers a
+    # confirmation prompt that would block the task in non-interactive contexts.
+    NON_SENSITIVE_TYPES = {
+        "done", "fail", "wait", "move", "scroll",
+        "key", "hotkey", "switch_window",
+    }
+    if action_type in NON_SENSITIVE_TYPES:
+        return False, ""
+
     # file delete is always sensitive
     if action_type == "delete_file":
         return True, "This will permanently delete a file."
 
-    # Check all string values in the action dict for sensitive keywords
+    # Check all string values in the action dict for sensitive keywords.
+    # _raw is excluded to avoid matching against the raw action string itself.
     text_to_check = " ".join(
-        str(v) for v in action.values() if isinstance(v, str)
+        str(v) for k, v in action.items()
+        if isinstance(v, str) and k != "_raw"
     ).lower()
 
     for pattern in _COMPILED:

@@ -1,9 +1,10 @@
-# AccessOS -- Main Entry Point (Phase 2)
+# AccessOS -- Main Entry Point (Phase 3)
 # Core loop:
-#   Text input -> Screenshot -> UI-TARS -> Validate -> Safety Check
-#   -> Execute -> Verify -> Anti-repetition -> Repeat
+#   Text input  -> Screenshot -> UI-TARS -> Validate -> Safety Check
+#   -> Execute  -> Verify -> Anti-repetition -> Repeat
 #
-# Voice and wake-word will be added in Phase 3.
+# Voice mode (Phase 3):
+#   Wake word -> STT -> run_task() -> TTS response
 # Safety confirmations will be enhanced in Phase 8.
 
 import sys
@@ -16,6 +17,16 @@ from agent.brain import ask_uitars
 from computer.validator import validate_action
 from computer.executor import execute_action
 from safety.guard import check_action, is_sensitive
+
+# -- Phase 3: Voice modules (graceful degradation if pyaudio missing) ---------
+try:
+    from voice.tts import TTS
+    from voice.stt import STT
+    from voice.wake_word import WakeWordDetector
+    _VOICE_AVAILABLE = True
+except Exception as _ve:
+    _VOICE_AVAILABLE = False
+    print(f"[main] Voice modules unavailable: {_ve}")
 
 # -- Emergency stop --------------------------------------------------------
 # Moving the mouse to the top-left corner triggers pyautogui.FailSafeException
@@ -98,6 +109,24 @@ def run_task(task: str) -> str:
             return "Agent failed: UI-TARS did not return a valid action."
 
         print("[loop] Action received: {}".format(action))
+
+        # -- Step 2b: First-action guard -------------------------------------
+        # Prevent the model from calling done()/fail() on the very first step
+        # without having attempted anything. This stops hallucination where the
+        # model claims a task is already complete without taking any action.
+        if action_count == 0 and action["type"] in ("done", "fail"):
+            print("[loop] WARNING: Model called {}() without attempting the task. "
+                  "Forcing a real action.".format(action["type"]))
+            history.append({
+                "action": action.get("_raw", "done()"),
+                "result": (
+                    "REJECTED: You must attempt the task before calling done() or fail(). "
+                    "No actions have been taken yet. Please perform the task now."
+                ),
+                "observation": screenshot
+            })
+            action_count += 1
+            continue
 
         # -- Step 3: Anti-repetition guard -----------------------------------
         current_raw = action.get("_raw", "")
@@ -192,13 +221,95 @@ def run_task(task: str) -> str:
     return "Reached maximum action limit ({}). Task stopped.".format(MAX_ACTIONS_PER_TASK)
 
 
-# -- CLI entry point -------------------------------------------------------
+# -- Voice mode ---------------------------------------------------------------
+
+def run_voice_mode() -> None:
+    """
+    Full voice pipeline:
+        Wake word → STT → run_task() → TTS
+
+    The loop runs indefinitely until the user says 'stop' / 'quit' / 'exit',
+    presses Ctrl+C, or moves the mouse to the top-left corner.
+    """
+    if not _VOICE_AVAILABLE:
+        print("[Voice] Voice mode is not available.")
+        print("[Voice] Install pyaudio: python -m pip install pyaudio")
+        return
+
+    tts = TTS()
+    stt = STT(listen_timeout=8.0, phrase_time_limit=12.0)
+    detector = WakeWordDetector()
+
+    if not stt.available:
+        print("[Voice] Microphone/PyAudio not available. "
+              "Cannot start voice mode.")
+        return
+
+    tts.speak("Access OS voice mode active. Say Hey Access to give a command.")
+    stt.calibrate()
+
+    print("\n[Voice] Listening for 'Hey Access'... (Ctrl+C to stop)")
+
+    try:
+        while True:
+            # Step 1 — Wait for wake word
+            detected = detector.wait_for_wake_word()
+            if not detected:
+                break
+
+            tts.speak("Yes?")
+
+            # Step 2 — Listen for the command
+            print("[Voice] Listening for command...")
+            command = stt.listen_once(prompt="Speak your command now...")
+
+            if not command:
+                tts.speak("Sorry, I didn't catch that. Say Hey Access to try again.")
+                continue
+
+            print(f"[Voice] Command: {command!r}")
+
+            # Step 3 — Check for stop commands
+            if any(w in command.lower() for w in ("stop", "quit", "exit", "goodbye")):
+                tts.speak("Goodbye. Stopping voice mode.")
+                break
+
+            # Step 4 — Confirm command back to user
+            tts.speak_async(f"Running: {command}")
+
+            # Step 5 — Execute via the same run_task() loop
+            try:
+                result = run_task(command)
+                print(f"[Voice] Result: {result}")
+                # Trim long results for TTS
+                spoken = result if len(result) <= 120 else result[:120] + "."
+                tts.speak(spoken)
+            except pyautogui.FailSafeException:
+                tts.speak("Emergency stop triggered.")
+                break
+            except Exception as e:
+                tts.speak(f"An error occurred: {e}")
+                print(f"[Voice] Error: {e}")
+
+    except KeyboardInterrupt:
+        print("\n[Voice] Voice mode stopped by user.")
+        tts.speak("Voice mode stopped.")
+
+
+# -- CLI entry point -----------------------------------------------------------
 
 def main():
+    # Check for --voice flag
+    voice_mode = "--voice" in sys.argv
+
     print("=" * 60)
-    print("  AccessOS -- AI Computer-Use Agent (Phase 2)")
+    print("  AccessOS -- AI Computer-Use Agent (Phase 3)")
     print("  Model: UI-TARS-1.5-7B via Featherless")
     print("  Emergency Stop: move mouse to top-left corner")
+    if voice_mode:
+        print("  Mode: VOICE (wake word: 'Hey Access')")
+    else:
+        print("  Mode: TEXT  (type 'voice' to switch to voice mode)")
     print("  Type 'quit' or 'exit' to close.")
     print("=" * 60)
 
@@ -214,9 +325,15 @@ def main():
 
     print()
 
+    # Launch voice mode directly if --voice flag passed
+    if voice_mode:
+        run_voice_mode()
+        return
+
+    # Text mode (default)
     while True:
         try:
-            task = input("Enter task (or 'quit'): ").strip()
+            task = input("Enter task (or 'quit' / 'voice'): ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n[AccessOS] Exiting.")
             break
@@ -227,6 +344,11 @@ def main():
         if task.lower() in ("quit", "exit", "q"):
             print("[AccessOS] Goodbye.")
             break
+
+        # Switch to voice mode on demand
+        if task.lower() == "voice":
+            run_voice_mode()
+            continue
 
         result = run_task(task)
         print("\n[AccessOS] Final result: {}\n".format(result))

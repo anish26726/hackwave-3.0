@@ -37,18 +37,26 @@ ACTION FORMAT (reply with exactly ONE line, nothing else):
 COORDINATES: [x_percent, y_percent] where [0,0]=top-left, [100,100]=bottom-right.
 
 CRITICAL RULES:
-1. If the task is already complete (you can see the result on screen), call done() IMMEDIATELY.
-2. If you just opened an app and can see it on screen, call done() - do NOT open it again.
-3. NEVER repeat the exact same action twice in a row. If an action did not work, try something different.
-4. Do NOT write explanations, chain-of-thought, or extra text. ONE action line only.
-5. If the task involved opening an app and that app is now visible, the task is done."""
+1. ALWAYS perform the required action first. NEVER call done() on the very first step without attempting the task.
+2. Only call done() AFTER you have already executed an action AND you can clearly see the result on screen.
+3. If the task is to open an app, use open_app() first — only call done() after the app window is visible on screen.
+4. NEVER repeat the exact same action twice in a row. If an action did not work, try something different.
+5. Do NOT write explanations, chain-of-thought, or extra text. ONE action line only.
+6. If you just successfully opened an app and can see it on screen, call done().
+7. If the task is already visibly complete from a PREVIOUS action, call done()."""
 
 
 def _build_messages(task: str, screenshot_b64: str, history: list[dict]) -> list[dict]:
-    """Build the messages array for the chat completions API."""
+    """
+    Build the messages array for the chat completions API.
+
+    Only the CURRENT screenshot is sent as an image; previous steps are
+    summarised as text to avoid payload/token explosion on long tasks.
+    """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Include action history with results so model knows what already happened
+    # Include action history as text-only (no old screenshots) so the
+    # context stays small regardless of how many steps have run.
     for entry in history:
         action_text = entry.get("action", "")
         result_text = entry.get("result", "")
@@ -57,23 +65,17 @@ def _build_messages(task: str, screenshot_b64: str, history: list[dict]) -> list
             assistant_content = f"{action_text}  # Result: {result_text}"
         messages.append({"role": "assistant", "content": assistant_content})
 
-        if entry.get("observation"):
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "text",
-                     "text": (
-                         f"After that action ({result_text}), the screen changed. "
-                         f"Look at the updated screen and continue the task: {task}. "
-                         f"If the task is now complete, call done()."
-                     )},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:image/jpeg;base64,{entry['observation']}"
-                    }}
-                ]
-            })
+        # Send a text-only follow-up (no base64 blob) for historical steps.
+        messages.append({
+            "role": "user",
+            "content": (
+                f"After that action the screen updated (result: {result_text}). "
+                f"Continue working on the task: {task}. "
+                f"If the task is now complete, call done()."
+            )
+        })
 
-    # Current turn
+    # Current turn — only this screenshot is sent as an image.
     messages.append({
         "role": "user",
         "content": [
@@ -130,8 +132,9 @@ def ask_uitars(task: str, screenshot_b64: str, history: list[dict] | None = None
             last_error = TimeoutError(f"API timed out after {API_TIMEOUT_SECONDS}s")
         except requests.exceptions.HTTPError as e:
             last_error = e
-            # 4xx errors are not retryable (bad key, bad model, etc.)
-            if response.status_code < 500:
+            # 429 Too Many Requests is retryable with backoff.
+            # Other 4xx errors (bad key, bad model, etc.) are not retryable.
+            if response.status_code != 429 and response.status_code < 500:
                 print(f"[brain] API error {response.status_code}: {response.text}")
                 return None
         except (KeyError, IndexError) as e:
@@ -191,13 +194,29 @@ def _parse_action(raw: str) -> Optional[dict]:
     if point_m:
         result["point"] = [float(point_m.group(1)), float(point_m.group(2))]
     else:
-        # Fallback for UI-TARS native format: start_box='<|box_start|>(825,707)<|box_end|>'
-        # These are scaled to 1000. So 825 = 82.5%
-        box_m = re.search(r"\(([0-9]+),([0-9]+)\)", args_str)
-        if box_m:
-            x_val = float(box_m.group(1)) / 10.0
-            y_val = float(box_m.group(2)) / 10.0
-            result["point"] = [x_val, y_val]
+        # Fallback for UI-TARS native 4-coordinate bounding box:
+        #   start_box='<|box_start|>(ymin,xmin,ymax,xmax)<|box_end|>'
+        #   OR simple 2-point form: (x, y) — all coordinates scaled 0-1000.
+        # Try 4-coordinate form first (ymin, xmin, ymax, xmax).
+        box4_m = re.search(
+            r"\(([0-9]+),([0-9]+),([0-9]+),([0-9]+)\)", args_str
+        )
+        if box4_m:
+            ymin = float(box4_m.group(1))
+            xmin = float(box4_m.group(2))
+            ymax = float(box4_m.group(3))
+            xmax = float(box4_m.group(4))
+            # Compute center and convert from 0-1000 scale to 0-100 percent.
+            x_val = ((xmin + xmax) / 2.0) / 10.0
+            y_val = ((ymin + ymax) / 2.0) / 10.0
+            result["point"] = [round(x_val, 2), round(y_val, 2)]
+        else:
+            # 2-coordinate form: (x, y) scaled 0-1000 → 0-100%.
+            box2_m = re.search(r"\(([0-9]+),([0-9]+)\)", args_str)
+            if box2_m:
+                x_val = float(box2_m.group(1)) / 10.0
+                y_val = float(box2_m.group(2)) / 10.0
+                result["point"] = [round(x_val, 2), round(y_val, 2)]
 
     # Extract text='...'
     text_m = re.search(r"text=['\"](.+?)['\"](?=\s*[,)]|$)", args_str, re.DOTALL)

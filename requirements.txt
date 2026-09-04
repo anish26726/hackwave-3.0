@@ -1,12 +1,13 @@
 mss
 Pillow
 pyautogui
+pygetwindow
 pynput
 requests
 python-dotenv
 SpeechRecognition
-pyttsx3
 pyaudio
+pyttsx3
 pytesseract
 keyboard
 comtypes
