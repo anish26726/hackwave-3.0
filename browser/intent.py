@@ -105,8 +105,26 @@ def parse_browser_intent(text: str) -> Optional[dict]:
         url = _normalise_url(raw_url)
         return {'op': 'navigate', 'url': url, 'browser': browser}
 
-    # ── Search (with explicit "search for" or "google for") ──────────────
-    # "search for AI hackathons", "google for Python tutorials"
+    # ── Site-specific search: "search X in/on youtube" ──────────────────
+    # Must run BEFORE the generic search pattern so it takes priority.
+    # Patterns: "search X on youtube", "search X in youtube",
+    #           "look up X on reddit", "find X on amazon"
+    m = re.search(
+        r'\b(?:search|look\s+up|find)\s+'
+        r'["\']?(.+?)["\']?'
+        r'\s+(?:in|on)\s+'
+        r'(youtube|google|bing|reddit|amazon|wikipedia|twitter|x\.com|duck(?:duck)?go)\b',
+        t, re.IGNORECASE,
+    )
+    if m:
+        query  = m.group(1).strip().strip('"\'') 
+        site   = m.group(2).strip().lower().replace('.com', '')
+        # Normalise aliases
+        site_map = {'x': 'twitter', 'duckduckgo': 'duck', 'duckgo': 'duck'}
+        engine = site_map.get(site, site)
+        return {'op': 'search', 'query': query, 'engine': engine, 'browser': browser}
+
+    # ── Generic search: "search for X", "google for X", "look up X" ──────
     # Also handles: "open chrome and search for X"
     m = re.search(
         r'\b(?:search\s+(?:for|on\s+(?:google|the\s+web)\s+for)?|'
@@ -116,8 +134,8 @@ def parse_browser_intent(text: str) -> Optional[dict]:
         t, re.IGNORECASE,
     )
     if m:
-        query = m.group(1).strip().strip('"\'')
-        return {'op': 'search', 'query': query, 'browser': browser}
+        query = m.group(1).strip().strip('"\'') 
+        return {'op': 'search', 'query': query, 'engine': 'google', 'browser': browser}
 
     # ── Open browser only ─────────────────────────────────────────────────
     # "open chrome", "launch firefox"
@@ -145,11 +163,16 @@ def _normalise_url(raw: str) -> str:
 
 
 def build_search_url(query: str, engine: str = 'google') -> str:
-    """Build a search URL for the given query and engine."""
+    """Build a search URL for the given query and engine/site."""
     encoded = quote_plus(query)
     engines = {
-        'google': f'https://www.google.com/search?q={encoded}',
-        'bing':   f'https://www.bing.com/search?q={encoded}',
-        'duck':   f'https://duckduckgo.com/?q={encoded}',
+        'google':    f'https://www.google.com/search?q={encoded}',
+        'bing':      f'https://www.bing.com/search?q={encoded}',
+        'duck':      f'https://duckduckgo.com/?q={encoded}',
+        'youtube':   f'https://www.youtube.com/results?search_query={encoded}',
+        'reddit':    f'https://www.reddit.com/search/?q={encoded}',
+        'amazon':    f'https://www.amazon.com/s?k={encoded}',
+        'wikipedia': f'https://en.wikipedia.org/w/index.php?search={encoded}',
+        'twitter':   f'https://twitter.com/search?q={encoded}',
     }
     return engines.get(engine, engines['google'])

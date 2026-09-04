@@ -126,13 +126,48 @@ class BrowserHandler:
 
     def open_browser(self, browser: str = 'chrome', url: str = '') -> str:
         """
-        Launch the browser. Chrome is launched with --remote-debugging-port
-        so DOMReader can connect to it for page content extraction.
+        Bring the browser to the foreground.
+
+        If the browser is already open, focuses the existing window instead of
+        launching a new process. Only launches a new process when no window
+        is found.
 
         Args:
             browser: 'chrome', 'edge', or 'firefox'
-            url:     Optional URL to open immediately.
+            url:     Optional URL to open immediately (navigate after focusing).
         """
+        # ── Step 1: Try to focus an already-open window ───────────────────
+        if _PYGETWINDOW_OK:
+            titles = _BROWSER_WINDOW_TITLES.get(browser, ['Chrome'])
+            all_windows = _gw.getAllWindows()
+            for title_hint in titles:
+                matches = [
+                    w for w in all_windows
+                    if title_hint.lower() in w.title.lower() and w.title.strip()
+                ]
+                if matches:
+                    win = matches[0]
+                    try:
+                        if win.isMinimized:
+                            win.restore()
+                        win.activate()
+                    except Exception:
+                        try:
+                            win.minimize()
+                            time.sleep(0.15)
+                            win.restore()
+                        except Exception:
+                            pass
+                    time.sleep(0.5)
+                    # If a URL was requested, navigate to it now
+                    if url:
+                        try:
+                            return self.navigate(url, browser=browser)
+                        except BrowserError:
+                            pass
+                    return f"{browser.title()} is already open — brought to foreground."
+
+        # ── Step 2: No existing window found — launch a new process ───────
         exe = self._find_browser_exe(browser)
         if not exe:
             raise BrowserError(

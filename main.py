@@ -107,6 +107,30 @@ def _refocus_terminal() -> None:
     except Exception:
         pass
 
+# -- Phase 7: Multi-step task planner -----------------------------------------
+try:
+    from agent.planner import is_multi_step, decompose, format_plan_preview
+    _PLANNER_AVAILABLE = True
+except Exception as _pe:
+    _PLANNER_AVAILABLE = False
+    print(f"[main] Planner unavailable: {_pe}")
+
+# -- Phase 7+: LLM intent classifier (Qwen2.5-7B) ----------------------------
+try:
+    from agent.intent_model import classify_intent
+    _INTENT_LLM_AVAILABLE = True
+except Exception as _ie:
+    _INTENT_LLM_AVAILABLE = False
+    print(f"[main] LLM intent model unavailable: {_ie}")
+
+# -- Phase 7+: Vision screen summarizer (Qwen2-VL) ----------------------------
+try:
+    from agent.screen_summarizer import summarize_screen, summarize_text
+    _SUMMARIZER_AVAILABLE = True
+except Exception as _se:
+    _SUMMARIZER_AVAILABLE = False
+    print(f"[main] Vision summarizer unavailable: {_se}")
+
 # -- Module-level TTS singleton -----------------------------------------------
 _tts: "TTS | None" = None
 
@@ -130,7 +154,9 @@ class SessionContext:
     def __init__(self, max_entries: int = SESSION_CONTEXT_SIZE):
         self._entries: list[dict] = []
         self._max = max_entries
-        self.last_file_path: "str | None" = None   # Phase 5: last file context
+        self.last_file_path: "str | None" = None     # Phase 5: last file context
+        self.last_browser_url: "str | None" = None   # Phase 7: last navigated URL
+        self.last_step_results: list[tuple] = []     # Phase 7: [(step_text, result), …]
 
     def add(self, task: str, result: str) -> None:
         self._entries.append({"task": task, "result": result[:200]})
@@ -147,11 +173,19 @@ class SessionContext:
         ctx = "Recent task history (for context only):\n" + "\n".join(lines)
         if self.last_file_path:
             ctx += f"\nLast file operated on: {self.last_file_path}"
+        if self.last_browser_url:
+            ctx += f"\nLast browser URL: {self.last_browser_url}"
+        if self.last_step_results:
+            ctx += "\nLast multi-step results:"
+            for step_text, step_result in self.last_step_results[-3:]:
+                ctx += f"\n  - {step_text!r} → {step_result[:80]}"
         return ctx
 
     def clear(self) -> None:
         self._entries.clear()
         self.last_file_path = None
+        self.last_browser_url = None
+        self.last_step_results = []
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -631,11 +665,12 @@ def run_browser_command(task: str, tts=None) -> str:
 
         # ── search ────────────────────────────────────────────────────────
         elif op == 'search':
-            query = intent.get('query', '')
+            query  = intent.get('query', '')
+            engine = intent.get('engine', 'google')   # site-specific or default
             if not query:
                 msg = "Please specify a search query. Example: 'search for Python tutorials'"
             else:
-                msg = handler.search(query, browser=browser)
+                msg = handler.search(query, browser=browser, engine=engine)
 
         # ── back ──────────────────────────────────────────────────────────
         elif op == 'back':
@@ -681,6 +716,356 @@ def run_browser_command(task: str, tts=None) -> str:
     _refocus_terminal()
 
     return msg
+
+
+# ── Phase 7 — Multi-step autonomous task execution ────────────────────────
+
+def run_multi_step_task(goal: str, tts=None) -> str:
+    """
+    Decompose a compound goal into sub-steps and execute each one in order.
+
+    Pipeline for each step:
+        is_file_command?    → run_file_command()
+        is_browser_command? → run_browser_command()
+        else                → run_task() (UI-TARS loop)
+
+    Safety:
+        - Checks STOP_REQUESTED before every step.
+        - 1 retry per step on failure.
+        - Max steps capped at MAX_STEPS (10).
+        - Ctrl+C cancels remaining steps cleanly.
+
+    Args:
+        goal: User's compound natural language goal.
+        tts:  Optional TTS for voice output.
+
+    Returns:
+        Summary string of what was accomplished.
+    """
+    global STOP_REQUESTED
+
+    if not _PLANNER_AVAILABLE:
+        # Planner not loaded — fall back to single-step
+        return run_task(goal)
+
+    plan = decompose(goal)
+    preview = format_plan_preview(plan)
+
+    if preview:
+        print(preview)
+        if tts:
+            tts.speak(f"Starting {len(plan.steps)}-step task.")
+
+    step_results: list[tuple[str, str]] = []
+    completed = 0
+    failed_steps: list[str] = []
+
+    for i, step in enumerate(plan.steps, 1):
+        if STOP_REQUESTED:
+            msg = f"Task cancelled after {completed}/{len(plan.steps)} steps."
+            if tts:
+                tts.speak(msg)
+            break
+
+        print(f"\n[plan] ── Step {i}/{len(plan.steps)}: {step!r} ──")
+
+        step_result = _execute_single_step(step, tts=tts)
+
+        # Check if step failed — retry once
+        is_fail = (
+            step_result.startswith("FAIL")
+            or step_result.startswith("Agent failed")
+            or step_result.startswith("Screenshot failed")
+        )
+
+        if is_fail:
+            print(f"[plan] Step {i} failed: {step_result[:100]}. Retrying once...")
+            import time as _t; _t.sleep(1.0)
+            step_result = _execute_single_step(step, tts=None)  # No TTS on retry
+            is_fail = (
+                step_result.startswith("FAIL")
+                or step_result.startswith("Agent failed")
+            )
+
+        if is_fail:
+            print(f"[plan] ✗ Step {i} FAILED: {step_result[:100]}")
+            failed_steps.append(step)
+            step_results.append((step, f"FAILED: {step_result[:80]}"))
+        else:
+            print(f"[plan] ✓ Step {i} done: {step_result[:80]}")
+            step_results.append((step, step_result[:80]))
+            completed += 1
+
+        # Update browser URL context if this was a navigate/search step
+        if _BROWSER_AVAILABLE and is_browser_command(step):
+            try:
+                from browser.dom_reader import get_dom_reader
+                reader = get_dom_reader()
+                if reader.is_available():
+                    tab = reader.get_active_tab()
+                    if tab:
+                        _session.last_browser_url = tab.get('url', '')
+            except Exception:
+                pass
+
+    # Build summary
+    total = len(plan.steps)
+    if completed == total:
+        summary = f"All {total} steps completed successfully."
+    elif completed == 0:
+        summary = f"Task failed — no steps completed out of {total}."
+    else:
+        summary = (
+            f"Completed {completed}/{total} steps. "
+            f"Failed: {', '.join(failed_steps[:3])}"
+        )
+
+    # Store step results in session for follow-up context
+    _session.last_step_results = step_results
+    _session.add(goal, summary)
+
+    print(f"\n[plan] {summary}")
+    if tts:
+        tts.speak(summary)
+    _refocus_terminal()
+    return summary
+
+
+def _execute_single_step(step: str, tts=None) -> str:
+    """
+    Execute one sub-task step through the appropriate handler.
+    Returns a result string.
+    """
+    try:
+        # File operation
+        if _FILES_AVAILABLE and is_file_command(step):
+            return run_file_command(step, tts=tts)
+
+        # Browser operation
+        if _BROWSER_AVAILABLE and is_browser_command(step):
+            return run_browser_command(step, tts=tts)
+
+        # Screen reader
+        if _READER_AVAILABLE and is_screen_read_command(step):
+            run_screen_reader(step, tts=tts)
+            return "Screen read complete."
+
+        # General UI-TARS loop
+        return run_task(step)
+
+    except KeyboardInterrupt:
+        request_stop()
+        return "FAIL: cancelled by user"
+
+
+# ── Phase 7+ — LLM-routed task execution ─────────────────────────────────
+
+def run_llm_routed_task(task: str, tts=None) -> str:
+    """
+    Classify the user's command with Qwen2.5-7B and route to the correct handler.
+
+    Model responsibilities:
+        Qwen2.5-7B (text)  → intent classification + text summarization
+        Qwen2-VL   (vision) → screen/desktop visual description
+        UI-TARS    (vision+action) → GUI automation (clicks, forms, etc.)
+
+    Falls back to regex parsers + UI-TARS if LLM is unavailable.
+
+    Args:
+        task: User's natural language command.
+        tts:  Optional TTS instance for spoken output.
+
+    Returns:
+        Result string describing what was accomplished.
+    """
+    if not _INTENT_LLM_AVAILABLE:
+        return _execute_single_step(task, tts=tts)
+
+    print(f"[intent] Classifying: {task!r}")
+    intent = classify_intent(task)
+
+    if intent is None:
+        print("[intent] LLM unavailable — falling back to regex routing")
+        return _execute_single_step(task, tts=tts)
+
+    intent_type = intent.get("type", "general")
+    print(f"[intent] → type={intent_type}, op={intent.get('op','')}")
+
+    return _execute_intent(intent, task, tts=tts)
+
+
+def _execute_intent(intent: dict, original_task: str, tts=None) -> str:
+    """
+    Execute a classified intent dict through the appropriate handler.
+
+    Args:
+        intent:        Structured intent from classify_intent().
+        original_task: Original user text (for fallback + session logging).
+        tts:           Optional TTS instance.
+
+    Returns:
+        Result string.
+    """
+    intent_type = intent.get("type", "general")
+
+    try:
+        # ── Multi-step: classify and execute each sub-step ────────────────
+        if intent_type == "multi_step":
+            steps = intent.get("steps", [])
+            if not steps:
+                return run_task(original_task)
+
+            print(f"[intent] Multi-step plan: {len(steps)} steps")
+            for i, step in enumerate(steps, 1):
+                print(f"[intent] Step {i}/{len(steps)}: {step!r}")
+
+            # Re-use run_multi_step_task with the pre-decomposed steps
+            from dataclasses import dataclass
+
+            class _PrebuiltPlan:
+                def __init__(self, original, steps):
+                    self.original = original
+                    self.steps    = steps
+                    self.is_multi = len(steps) > 1
+
+            # Execute steps one by one using LLM intent for each
+            results = []
+            for i, step in enumerate(steps, 1):
+                if STOP_REQUESTED:
+                    break
+                print(f"\n[intent] ── Step {i}/{len(steps)}: {step!r} ──")
+                sub_intent = classify_intent(step) if _INTENT_LLM_AVAILABLE else None
+                if sub_intent:
+                    res = _execute_intent(sub_intent, step, tts=tts if i == len(steps) else None)
+                else:
+                    res = _execute_single_step(step, tts=tts if i == len(steps) else None)
+                results.append(res)
+                print(f"[intent] ✓ Step {i}: {res[:60]}")
+
+            summary = f"Completed {len(results)}/{len(steps)} steps."
+            _session.add(original_task, summary)
+            if tts:
+                tts.speak(summary)
+            _refocus_terminal()
+            return summary
+
+        # ── Screen read: use Qwen2-VL for desktop, DOM+text for webpages ──
+        elif intent_type == "screen_read":
+            # First try: browser DOM extraction + text summarization (fastest)
+            if _BROWSER_AVAILABLE and _SUMMARIZER_AVAILABLE:
+                try:
+                    from browser.dom_reader import get_dom_reader
+                    reader = get_dom_reader()
+                    if reader.is_available():
+                        dom_text = reader.get_page_text()
+                        if dom_text and len(dom_text.strip()) > 50:
+                            print("[intent] Using DOM text + Qwen2.5 for webpage summary")
+                            summary = summarize_text(dom_text, context=original_task)
+                            _session.add(original_task, summary[:200])
+                            if tts:
+                                tts.speak(summary)
+                            return summary
+                except Exception:
+                    pass
+
+            # Fallback: screenshot → Qwen2-VL
+            if _SUMMARIZER_AVAILABLE:
+                try:
+                    from screen.capture import capture_screen
+                    screenshot = capture_screen()
+                    print("[intent] Using Qwen2-VL for screen description")
+                    summary = summarize_screen(screenshot, context=original_task)
+                    _session.add(original_task, summary[:200])
+                    if tts:
+                        tts.speak(summary)
+                    return summary
+                except Exception as e:
+                    print(f"[intent] Vision summarizer failed: {e}")
+
+            # Final fallback: legacy OCR reader
+            if _READER_AVAILABLE:
+                run_screen_reader(original_task, tts=tts)
+                return "Screen read complete."
+            return "Screen read not available."
+
+        # ── Browser command: route to BrowserHandler ──────────────────────
+        elif intent_type == "browser":
+            if not _BROWSER_AVAILABLE:
+                return "Browser module not available."
+            # Convert intent dict to a fake task string that BrowserHandler understands
+            # OR call handler methods directly based on op
+            op      = intent.get("op", "")
+            browser = intent.get("browser", "chrome")
+            handler = get_browser_handler()
+
+            if op == "open_browser":
+                msg = handler.open_browser(browser=browser)
+            elif op == "navigate":
+                url = intent.get("url", "")
+                msg = handler.navigate(url, browser=browser) if url else \
+                      "No URL provided."
+            elif op == "search":
+                query  = intent.get("query", "")
+                engine = intent.get("engine", "google")
+                msg = handler.search(query, browser=browser, engine=engine) if query else \
+                      "No search query provided."
+            elif op == "back":
+                msg = handler.go_back(browser=browser)
+            elif op == "forward":
+                msg = handler.go_forward(browser=browser)
+            elif op == "refresh":
+                msg = handler.refresh(browser=browser)
+            elif op == "new_tab":
+                msg = handler.new_tab(browser=browser)
+            elif op == "close_tab":
+                msg = handler.close_tab(browser=browser)
+            elif op == "read_page":
+                # Read page → use summarizer if available
+                if _SUMMARIZER_AVAILABLE:
+                    try:
+                        from browser.dom_reader import get_dom_reader
+                        reader   = get_dom_reader()
+                        dom_text = reader.get_page_text() if reader.is_available() else ""
+                        if dom_text and len(dom_text.strip()) > 50:
+                            msg = summarize_text(dom_text, context="Read this webpage")
+                        else:
+                            from screen.capture import capture_screen
+                            msg = summarize_screen(capture_screen(), context="webpage")
+                    except Exception as e:
+                        msg = handler.read_page(query=original_task)
+                else:
+                    msg = handler.read_page(query=original_task)
+            else:
+                # Unknown op — fall through to regex browser routing
+                return run_browser_command(original_task, tts=tts)
+
+            print(f"\n[browser] {msg[:200]}\n")
+            _session.add(original_task, msg[:200])
+            if tts:
+                spoken = msg if len(msg) <= 300 else msg[:300] + "."
+                tts.speak(spoken)
+            _refocus_terminal()
+            return msg
+
+        # ── File command: route to FileHandler ────────────────────────────
+        elif intent_type == "file":
+            if not _FILES_AVAILABLE:
+                return "File module not available."
+            # Inject filename/path back into task string so run_file_command parses it
+            # This reuses the existing FileHandler without duplication
+            return run_file_command(original_task, tts=tts)
+
+        # ── General: visual task → UI-TARS screenshot loop ────────────────
+        else:
+            print("[intent] General visual task → UI-TARS")
+            return run_task(original_task)
+
+    except KeyboardInterrupt:
+        request_stop()
+        return "FAIL: cancelled by user"
+    except Exception as e:
+        print(f"[intent] Execution error: {e} — falling back to UI-TARS")
+        return run_task(original_task)
 
 
 def _resolve_path_from_intent(intent: dict, handler) -> str:
@@ -779,8 +1164,12 @@ def run_voice_mode() -> None:
             try:
                 if _READER_AVAILABLE and is_screen_read_command(command):
                     run_screen_reader(command, tts=tts)
+                elif _PLANNER_AVAILABLE and is_multi_step(command):
+                    run_multi_step_task(command, tts=tts)
                 elif _FILES_AVAILABLE and is_file_command(command):
                     run_file_command(command, tts=tts)
+                elif _BROWSER_AVAILABLE and is_browser_command(command):
+                    run_browser_command(command, tts=tts)
                 else:
                     result = run_task(command)
                     print(f"[Voice] Result: {result}")
@@ -804,8 +1193,10 @@ def main():
     voice_mode = "--voice" in sys.argv
 
     print("=" * 60)
-    print("  AccessOS -- AI Computer-Use Agent (Phase 5)")
-    print("  Model: UI-TARS-1.5-7B via Featherless")
+    print("  AccessOS -- AI Computer-Use Agent (Phase 7+)")
+    print("  Intent:      Qwen2.5-7B-Instruct (fast text)")
+    print("  Summarizer:  Qwen2-VL-7B-Instruct (vision)")
+    print("  GUI Actions: UI-TARS-1.5-7B (visual automation)")
     print("  Emergency Stop: move mouse to top-left corner")
     if voice_mode:
         print("  Mode: VOICE (wake word: 'Hey Access')")
@@ -833,6 +1224,12 @@ def main():
         modules.append("Screen Reader")
     if _FILES_AVAILABLE:
         modules.append("File Operations")
+    if _INTENT_LLM_AVAILABLE:
+        modules.append("LLM Intent (Qwen2.5-7B)")
+    if _SUMMARIZER_AVAILABLE:
+        modules.append("Vision Summarizer (Qwen2-VL)")
+    if _BROWSER_AVAILABLE:
+        modules.append("Browser Automation")
     print(f"  Active modules: {', '.join(modules) if modules else 'Core only'}")
     print()
 
@@ -864,43 +1261,32 @@ def main():
             print("[AccessOS] Session context cleared.\n")
             continue
 
-        # ── Routing ──────────────────────────────────────────────────────
-        # 1. Screen reader commands (Phase 4)
-        if _READER_AVAILABLE and is_screen_read_command(task):
-            tts_instance = _get_tts()
-            run_screen_reader(task, tts=tts_instance)
-            print("\n[AccessOS] Screen read complete.\n")
-            continue
-
-        # 2. File operation commands (Phase 5)
-        if _FILES_AVAILABLE and is_file_command(task):
-            tts_instance = _get_tts()
-            try:
-                run_file_command(task, tts=tts_instance)
-            except KeyboardInterrupt:
-                print("\n[AccessOS] File operation cancelled.\n")
-            print("\n[AccessOS] File operation complete.\n")
-            continue
-
-        # 2.5 Browser commands (Phase 6)
-        if _BROWSER_AVAILABLE and is_browser_command(task):
-            tts_instance = _get_tts()
-            try:
-                run_browser_command(task, tts=tts_instance)
-            except KeyboardInterrupt:
-                print("\n[AccessOS] Browser operation cancelled.\n")
-            print("\n[AccessOS] Browser operation complete.\n")
-            continue
-
-        # 3. General computer-use task → UI-TARS loop (Phase 2/3)
+        # ── Routing (Phase 7+) ────────────────────────────────────────────
+        # PRIMARY: LLM intent classifier (Qwen2.5-7B) — understands natural language
+        # FALLBACK: regex parsers → UI-TARS (if LLM unavailable/timeout)
+        tts_instance = _get_tts()
         try:
-            result = run_task(task)
+            if _INTENT_LLM_AVAILABLE:
+                result = run_llm_routed_task(task, tts=tts_instance)
+            else:
+                # Legacy regex routing fallback
+                if _PLANNER_AVAILABLE and is_multi_step(task):
+                    result = run_multi_step_task(task, tts=tts_instance) or ""
+                elif _READER_AVAILABLE and is_screen_read_command(task):
+                    run_screen_reader(task, tts=tts_instance)
+                    result = "Screen read complete."
+                elif _FILES_AVAILABLE and is_file_command(task):
+                    result = run_file_command(task, tts=tts_instance) or ""
+                elif _BROWSER_AVAILABLE and is_browser_command(task):
+                    result = run_browser_command(task, tts=tts_instance) or ""
+                else:
+                    result = run_task(task)
         except KeyboardInterrupt:
             request_stop()
             print("\n[AccessOS] Task cancelled by user (Ctrl+C).\n")
             continue
 
-        print("\n[AccessOS] Final result: {}\n".format(result))
+        print("\n[AccessOS] Done: {}\n".format(result[:120]))
 
 
 if __name__ == "__main__":

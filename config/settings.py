@@ -55,3 +55,17 @@ SESSION_CONTEXT_SIZE: int = int(os.environ.get('SESSION_CONTEXT_SIZE', '5'))
 # Optional: set TESSERACT_CMD in .env if Tesseract is not on your PATH.
 # Example: TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
 TESSERACT_CMD: str = os.environ.get('TESSERACT_CMD', '')
+
+# ── Phase 7+ LLM intent classifier ────────────────────────────────────────
+# Fast text-only model for natural-language intent classification.
+# Replaces regex parsers for browser, file, and multi-step commands.
+# Configurable — set INTENT_MODEL in .env to use a different model.
+INTENT_MODEL: str   = os.environ.get('INTENT_MODEL', 'Qwen/Qwen2.5-7B-Instruct')
+INTENT_MODEL_TIMEOUT: int = int(os.environ.get('INTENT_MODEL_TIMEOUT', '8'))
+
+# ── Phase 7+ Vision screen summarizer ─────────────────────────────────────
+# Vision-language model for describing/summarizing screen content.
+# Separate from UI-TARS (action model) — this model is trained to describe images.
+SUMMARIZER_MODEL: str   = os.environ.get('SUMMARIZER_MODEL', 'Qwen/Qwen2-VL-7B-Instruct')
+SUMMARIZER_TIMEOUT: int = int(os.environ.get('SUMMARIZER_TIMEOUT', '20'))
+
