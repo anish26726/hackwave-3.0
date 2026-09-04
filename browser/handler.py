@@ -232,21 +232,92 @@ class BrowserHandler:
         # Browser window not found — may not be open yet
         return False
 
+    def _ensure_browser_open(self, browser: str = 'chrome') -> None:
+        """
+        Guarantee the browser is open and in the foreground before any action.
+
+        Strategy:
+          1. Check for an existing browser window via pygetwindow → focus it.
+          2. If no window found → launch a new browser process and wait for it.
+
+        This means users NEVER need to say "open chrome" before searching/navigating.
+        Any browser command automatically opens Chrome if it's not already running.
+        """
+        # Step 1: Try to focus existing window
+        if _PYGETWINDOW_OK:
+            title_hints = _BROWSER_WINDOW_TITLES.get(browser, ['Chrome'])
+            try:
+                all_windows = _gw.getAllWindows()
+                for hint in title_hints:
+                    matches = [
+                        w for w in all_windows
+                        if hint.lower() in w.title.lower() and w.title.strip()
+                    ]
+                    if matches:
+                        win = matches[0]
+                        try:
+                            if win.isMinimized:
+                                win.restore()
+                            win.activate()
+                        except Exception:
+                            try:
+                                win.minimize()
+                                time.sleep(0.15)
+                                win.restore()
+                            except Exception:
+                                pass
+                        time.sleep(0.6)
+                        print(f"[browser] Focused existing {browser} window.")
+                        return   # ✅ already open
+            except Exception:
+                pass
+
+        # Step 2: No existing window — launch browser
+        print(f"[browser] {browser.title()} not open — launching automatically...")
+        exe = self._find_browser_exe(browser)
+        if not exe:
+            raise BrowserError(
+                f"Could not find {browser.title()} on this computer. "
+                "Please install it or check the installation path."
+            )
+        args = [exe]
+        if browser == 'chrome':
+            args.append(f'--remote-debugging-port={CDP_PORT}')
+        try:
+            subprocess.Popen(
+                args,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+            )
+            time.sleep(3.0)   # wait for window to appear
+            # Now focus the newly opened window
+            if _PYGETWINDOW_OK:
+                title_hints = _BROWSER_WINDOW_TITLES.get(browser, ['Chrome'])
+                all_windows = _gw.getAllWindows()
+                for hint in title_hints:
+                    matches = [
+                        w for w in all_windows
+                        if hint.lower() in w.title.lower() and w.title.strip()
+                    ]
+                    if matches:
+                        try:
+                            matches[0].activate()
+                            time.sleep(0.4)
+                        except Exception:
+                            pass
+                        return
+        except Exception as e:
+            raise BrowserError(f"Failed to launch {browser.title()}: {e}")
+
     def navigate(self, url: str, browser: str = 'chrome') -> str:
         """
         Navigate the active browser tab to a URL.
+        Automatically opens Chrome if not already running.
         Uses Ctrl+L (address bar focus) → type URL → Enter.
-
-        Args:
-            url:     Target URL.
-            browser: Browser hint (for error messages).
         """
         url = self._validate_url(url)
 
-        # Bring browser to foreground BEFORE sending keystrokes
-        focused = self._focus_browser(browser)
-        if not focused:
-            print(f"[browser] Could not find {browser} window — trying anyway.")
+        # Ensure browser is open and focused (auto-launches if needed)
+        self._ensure_browser_open(browser)
 
         # Focus address bar
         pyautogui.hotkey('ctrl', 'l')
@@ -264,51 +335,51 @@ class BrowserHandler:
 
     def search(self, query: str, browser: str = 'chrome', engine: str = 'google') -> str:
         """
-        Open browser (if needed) and search for the query on Google.
+        Search for a query. Automatically opens Chrome if not already running.
 
         Args:
             query:   Search query string.
             browser: Browser to use.
-            engine:  Search engine ('google', 'bing', 'duck').
+            engine:  Search engine ('google', 'youtube', 'bing', etc.).
         """
         if not query.strip():
             raise BrowserError("Search query cannot be empty.")
 
         url = build_search_url(query.strip(), engine)
-        result = self.navigate(url, browser)
-        return f"Searching for '{query}' on {engine.title()}..."
+        self.navigate(url, browser)   # navigate() calls _ensure_browser_open
+        return f"Searching for '{query}' on {engine.title()}."
 
     def go_back(self, browser: str = 'chrome') -> str:
-        """Navigate back one page (Alt+Left)."""
-        self._focus_browser(browser)
+        """Navigate back one page (Alt+Left). Auto-opens browser if needed."""
+        self._ensure_browser_open(browser)
         pyautogui.hotkey('alt', 'left')
         time.sleep(0.8)
         return "Went back to the previous page."
 
     def go_forward(self, browser: str = 'chrome') -> str:
-        """Navigate forward one page (Alt+Right)."""
-        self._focus_browser(browser)
+        """Navigate forward one page (Alt+Right). Auto-opens browser if needed."""
+        self._ensure_browser_open(browser)
         pyautogui.hotkey('alt', 'right')
         time.sleep(0.8)
         return "Went forward to the next page."
 
     def refresh(self, browser: str = 'chrome') -> str:
-        """Refresh the current page (F5)."""
-        self._focus_browser(browser)
+        """Refresh the current page (F5). Auto-opens browser if needed."""
+        self._ensure_browser_open(browser)
         pyautogui.press('f5')
         time.sleep(1.0)
         return "Page refreshed."
 
     def new_tab(self, browser: str = 'chrome') -> str:
-        """Open a new browser tab (Ctrl+T)."""
-        self._focus_browser(browser)
+        """Open a new browser tab (Ctrl+T). Auto-opens browser if needed."""
+        self._ensure_browser_open(browser)
         pyautogui.hotkey('ctrl', 't')
         time.sleep(0.5)
         return "Opened a new tab."
 
     def close_tab(self, browser: str = 'chrome') -> str:
-        """Close the current browser tab (Ctrl+W)."""
-        self._focus_browser(browser)
+        """Close the current browser tab (Ctrl+W). Auto-opens browser if needed."""
+        self._ensure_browser_open(browser)
         pyautogui.hotkey('ctrl', 'w')
         time.sleep(0.5)
         return "Closed the current tab."

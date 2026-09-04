@@ -43,7 +43,8 @@ CRITICAL RULES:
 4. NEVER repeat the exact same action twice in a row. If an action did not work, try something different.
 5. Do NOT write explanations, chain-of-thought, or extra text. ONE action line only.
 6. If you just successfully opened an app and can see it on screen, call done().
-7. If the task is already visibly complete from a PREVIOUS action, call done()."""
+7. If the task is already visibly complete from a PREVIOUS action, call done().
+8. BROWSER RULE: When asked to open a browser or Chrome specifically, ALWAYS use open_app(name='Chrome'). Never open Edge or Firefox unless the user explicitly asks for them."""
 
 
 def _build_messages(task: str, screenshot_b64: str, history: list[dict],

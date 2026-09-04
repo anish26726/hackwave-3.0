@@ -678,3 +678,75 @@ USER GIVES A GOAL
 
 Make the final implementation stable enough for a live hackathon demonstration.
 Use them sequentially. If your coding agent gets stuck or gives you an error during any phase, stop there and send me its output rather than moving to the next prompt.
+  
+
+
+
+  Great idea from your mentor! It makes the demo much more impressive — the agent is just **always there**, like a true OS-level assistant.
+
+Here's my take on the best approach for Windows startup:
+
+---
+
+### Recommendation: Windows Task Scheduler ✅
+
+**Why not the Startup folder?**
+- Startup folder runs immediately at login, before the desktop fully loads — pyautogui and screen capture can fail
+- No way to add a delay or retry
+
+**Why Task Scheduler is better:**
+- Run at logon with a **10-second delay** (gives Windows time to fully boot)
+- Auto-restart if it crashes
+- Can run with a specific Python environment (`.venv`)
+
+---
+
+### How to set it up (no code changes needed)
+
+**Step 1** — Open Task Scheduler:
+```
+Win + R → taskschd.msc → Enter
+```
+
+**Step 2** — Create Basic Task:
+- Name: `AccessOS`
+- Trigger: **When I log on**
+- Action: **Start a program**
+- Program: `C:\Users\akshi\Documents\hackwave-3.0\.venv\Scripts\python.exe`
+- Arguments: `main.py`
+- Start in: `C:\Users\akshi\Documents\hackwave-3.0`
+
+**Step 3** — In "Conditions" tab:
+- Uncheck "Start only if on AC power"
+
+**Step 4** — In "Settings" tab:
+- ✅ "If the task fails, restart every: 1 minute"
+- Attempts: 3
+
+---
+
+### OR — simpler 1-minute setup with a `.bat` file
+
+Create `start_accessos.bat` in the Startup folder:
+
+```
+Win + R → shell:startup → Enter
+```
+
+Then create a file there with:
+```bat
+@echo off
+timeout /t 10 /nobreak
+cd /d C:\Users\akshi\Documents\hackwave-3.0
+.venv\Scripts\python.exe main.py
+```
+
+The `timeout /t 10` waits 10 seconds after login before starting so everything is ready.
+
+---
+
+### My opinion
+
+**Go with Task Scheduler** for the hackathon — it's more reliable, has auto-restart, and looks professional. The `.bat` file is fine for a quick demo but has no fault tolerance.
+
+Want me to create the `.bat` file or a Task Scheduler setup script?

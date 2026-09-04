@@ -158,7 +158,10 @@ class STT:
         """
         # ── Backend 1: Google Web Speech API ──────────────────────────────
         try:
-            text = self.recognizer.recognize_google(audio)
+            # Phase 9 multilingual update: using 'en-IN' (Indian English) which
+            # natively handles Hindi/English code-switching (Hinglish) much better
+            # than default US English, preventing Hindi words from being garbled.
+            text = self.recognizer.recognize_google(audio, language="en-IN")
             print(f"[STT] (Google) Heard: {text!r}")
             return text.strip()
         except sr.UnknownValueError:

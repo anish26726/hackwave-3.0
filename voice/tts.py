@@ -70,11 +70,12 @@ class TTS:
                 print(f"[TTS] Speak error: {e}")
 
     def speak_async(self, text: str) -> None:
-        """Speak asynchronously in a background thread."""
-        print(f"[TTS] {text}")
+        """Speak asynchronously in a background thread (non-blocking)."""
+        # Don't print here — caller already logs the message.
+        # Printing from a background thread causes garbled stdout.
         if not self._available:
             return
-        
+
         t = threading.Thread(target=self._speak_thread, args=(text,), daemon=True)
         t.start()
 

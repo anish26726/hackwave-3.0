@@ -1072,11 +1072,21 @@ def _execute_intent(intent: dict, original_task: str, tts=None) -> str:
             if not _FILES_AVAILABLE:
                 return "File module not available."
 
-            # Phase 8: delete/remove always requires explicit confirmation
+            # Phase 8+9: delete/remove always requires explicit confirmation
             file_op = intent.get("op", "")
             if file_op in ("delete", "remove"):
-                filename = intent.get("filename", "this file")
-                allowed  = confirm_sensitive_action(
+                filename = intent.get("filename", "")
+                # Phase 9: resolve vague "this file" reference to session context
+                if not filename or filename.lower() in ("this file", "it", "the file", ""):
+                    if _session.last_file_path:
+                        filename = _session.last_file_path
+                        print(f"[intent] Resolved 'this file' → {filename!r} from session")
+                    else:
+                        return (
+                            "I don't know which file to delete. "
+                            "Please say 'delete [filename]' with the specific file name."
+                        )
+                allowed = confirm_sensitive_action(
                     reason=f"This will permanently delete '{filename}'. This cannot be undone.",
                     action_description=f"Delete: {filename}",
                     tts=tts,
@@ -1087,7 +1097,26 @@ def _execute_intent(intent: dict, original_task: str, tts=None) -> str:
             # Reuse the existing FileHandler without duplication
             return run_file_command(original_task, tts=tts)
 
-        # ── General: visual task → UI-TARS screenshot loop ────────────────
+        # ── App launch: open desktop apps directly via executor ────────────────
+        elif intent_type == "app":
+            app_name = intent.get("name", "").strip()
+            if not app_name:
+                print("[intent] App intent missing 'name' — falling to UI-TARS")
+                return run_task(original_task)
+            try:
+                print(f"[intent] Launching app: {app_name!r}")
+                result = execute_action({"type": "open_app", "name": app_name})
+                msg = f"Opened {app_name}."
+                _session.add(original_task, msg)
+                if tts:
+                    tts.speak(msg)
+                _refocus_terminal()
+                return msg
+            except Exception as e:
+                print(f"[intent] open_app failed ({e}) — falling to UI-TARS")
+                return run_task(original_task)
+
+        # ── General: visual task → UI-TARS screenshot loop ──────────────────
         else:
             print("[intent] General visual task → UI-TARS")
             return run_task(original_task)
@@ -1185,28 +1214,56 @@ def run_voice_mode() -> None:
                 tts.speak("Sorry, I didn't catch that. Say Hey Access to try again.")
                 continue
 
+            command = command.strip()
             print(f"[Voice] Command: {command!r}")
+
+            # Noise filter: only reject TRUE audio noise, not natural language.
+            # The LLM handles ALL natural language — don't second-guess it here.
+            # Only reject:
+            #   - Very short output (≤2 chars) — microphone blip
+            #   - >50% non-ASCII — definitely not English speech (hardware noise)
+            def _is_audio_noise(text: str) -> bool:
+                if len(text.strip()) <= 2:
+                    return True
+                non_ascii = sum(1 for c in text if ord(c) > 127)
+                if non_ascii / max(len(text), 1) > 0.50:
+                    return True
+                return False
+
+            if _is_audio_noise(command):
+                print(f"[Voice] Audio noise detected: {command!r} — ignoring")
+                tts.speak("I didn't catch that. Please say Hey Access and try again.")
+                continue
+
 
             if any(w in command.lower() for w in ("stop", "quit", "exit", "goodbye")):
                 tts.speak("Goodbye. Stopping voice mode.")
                 break
 
-            tts.speak_async(f"Running: {command}")
+            # Bug fix #4: use speak() synchronously so TTS finishes before agent starts
+            # (prevents own voice triggering the next wake-word detection)
+            tts.speak(f"Running: {command}")
 
             try:
-                if _READER_AVAILABLE and is_screen_read_command(command):
-                    run_screen_reader(command, tts=tts)
-                elif _PLANNER_AVAILABLE and is_multi_step(command):
-                    run_multi_step_task(command, tts=tts)
-                elif _FILES_AVAILABLE and is_file_command(command):
-                    run_file_command(command, tts=tts)
-                elif _BROWSER_AVAILABLE and is_browser_command(command):
-                    run_browser_command(command, tts=tts)
+                # Phase 9: voice routes through the same LLM intent pipeline as text
+                if _INTENT_LLM_AVAILABLE:
+                    result = run_llm_routed_task(command, tts=tts)
+                    print(f"[Voice] Result: {result[:80]}")
                 else:
-                    result = run_task(command)
-                    print(f"[Voice] Result: {result}")
-                    spoken = result if len(result) <= 120 else result[:120] + "."
-                    tts.speak(spoken)
+                    # Legacy regex fallback when LLM unavailable
+                    if _READER_AVAILABLE and is_screen_read_command(command):
+                        run_screen_reader(command, tts=tts)
+                    elif _PLANNER_AVAILABLE and is_multi_step(command):
+                        run_multi_step_task(command, tts=tts)
+                    elif _FILES_AVAILABLE and is_file_command(command):
+                        run_file_command(command, tts=tts)
+                    elif _BROWSER_AVAILABLE and is_browser_command(command):
+                        run_browser_command(command, tts=tts)
+                    else:
+                        result = run_task(command)
+                        print(f"[Voice] Result: {result}")
+                        spoken = result if len(result) <= 120 else result[:120] + "."
+                        tts.speak(spoken)
             except pyautogui.FailSafeException:
                 tts.speak("Emergency stop triggered.")
                 break
@@ -1225,7 +1282,7 @@ def main():
     voice_mode = "--voice" in sys.argv
 
     print("=" * 60)
-    print("  AccessOS -- AI Computer-Use Agent (Phase 7+)")
+    print("  AccessOS -- AI Computer-Use Agent (Phase 9)")
     print("  Intent:      Qwen2.5-7B-Instruct (fast text)")
     print("  Summarizer:  Qwen2-VL-7B-Instruct (vision)")
     print("  GUI Actions: UI-TARS-1.5-7B (visual automation)")
