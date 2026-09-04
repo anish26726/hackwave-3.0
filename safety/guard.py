@@ -34,11 +34,16 @@ def is_sensitive(action: dict) -> tuple[bool, str]:
     action_type = action.get("type", "")
 
     # These action types are never sensitive — skip keyword scan entirely.
-    # Avoids false positives where done(message="file removed") triggers a
-    # confirmation prompt that would block the task in non-interactive contexts.
+    # 'type' is excluded because the user may legitimately type words like
+    # "confirm", "send", or "apply" into web forms without those being
+    # sensitive computer-use actions. Scanning typed text causes constant
+    # spurious confirmation prompts and breaks normal usage.
     NON_SENSITIVE_TYPES = {
         "done", "fail", "wait", "move", "scroll",
         "key", "hotkey", "switch_window",
+        "type",   # B2 fix: typing text is never inherently sensitive
+        "click",  # clicking a coordinate is not sensitive by itself
+        "double_click", "right_click",
     }
     if action_type in NON_SENSITIVE_TYPES:
         return False, ""

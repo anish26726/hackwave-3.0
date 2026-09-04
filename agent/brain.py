@@ -46,14 +46,27 @@ CRITICAL RULES:
 7. If the task is already visibly complete from a PREVIOUS action, call done()."""
 
 
-def _build_messages(task: str, screenshot_b64: str, history: list[dict]) -> list[dict]:
+def _build_messages(task: str, screenshot_b64: str, history: list[dict],
+                    session_summary: str = "") -> list[dict]:
     """
     Build the messages array for the chat completions API.
 
     Only the CURRENT screenshot is sent as an image; previous steps are
     summarised as text to avoid payload/token explosion on long tasks.
+    An optional session_summary injects cross-task context (L3 fix).
     """
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Inject cross-task session context so follow-up commands work (L3 fix)
+    if session_summary:
+        messages.append({
+            "role": "user",
+            "content": f"Context from previous tasks:\n{session_summary}"
+        })
+        messages.append({
+            "role": "assistant",
+            "content": "Understood. I have context from previous actions."
+        })
 
     # Include action history as text-only (no old screenshots) so the
     # context stays small regardless of how many steps have run.
@@ -88,22 +101,24 @@ def _build_messages(task: str, screenshot_b64: str, history: list[dict]) -> list
     return messages
 
 
-def ask_uitars(task: str, screenshot_b64: str, history: list[dict] | None = None) -> Optional[dict]:
+# ── Shared HTTP helper (B8 fix — eliminates copy-paste retry logic) ────────
+
+def _featherless_post(
+    messages: list,
+    max_tokens: int,
+    temperature: float,
+) -> Optional[str]:
     """
-    Send the current screen and task to UI-TARS via Featherless.
+    POST to the Featherless chat completions endpoint with retry + back-off.
 
     Args:
-        task:           The user's natural-language goal.
-        screenshot_b64: Base64-encoded JPEG of the current screen.
-        history:        List of previous {action, observation} dicts for this task.
+        messages:    List of chat message dicts.
+        max_tokens:  Token budget for the response.
+        temperature: Sampling temperature (0.0 = deterministic).
 
     Returns:
-        Parsed action dict, e.g. {"type": "click", "point": [640, 400]}
-        Returns None on unrecoverable failure.
+        Raw content string from the model, or None on failure.
     """
-    history = history or []
-    messages = _build_messages(task, screenshot_b64, history)
-
     url = f"{FEATHERLESS_BASE_URL}/chat/completions"
     headers = {
         "Authorization": f"Bearer {get_api_key()}",
@@ -112,8 +127,8 @@ def ask_uitars(task: str, screenshot_b64: str, history: list[dict] | None = None
     payload = {
         "model": FEATHERLESS_MODEL,
         "messages": messages,
-        "max_tokens": 256,
-        "temperature": 0.0,   # Deterministic for reliability
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     }
 
     last_error: Optional[Exception] = None
@@ -124,15 +139,13 @@ def ask_uitars(task: str, screenshot_b64: str, history: list[dict] | None = None
             )
             response.raise_for_status()
             data = response.json()
-            raw_text = data["choices"][0]["message"]["content"].strip()
-            print(f"[brain] UI-TARS raw response: {raw_text}")
-            return _parse_action(raw_text)
+            return data["choices"][0]["message"]["content"].strip()
 
         except requests.exceptions.Timeout:
             last_error = TimeoutError(f"API timed out after {API_TIMEOUT_SECONDS}s")
         except requests.exceptions.HTTPError as e:
             last_error = e
-            # 429 Too Many Requests is retryable with backoff.
+            # 429 Too Many Requests is retryable with back-off.
             # Other 4xx errors (bad key, bad model, etc.) are not retryable.
             if response.status_code != 429 and response.status_code < 500:
                 print(f"[brain] API error {response.status_code}: {response.text}")
@@ -151,6 +164,34 @@ def ask_uitars(task: str, screenshot_b64: str, history: list[dict] | None = None
 
     print(f"[brain] All {MAX_RETRIES} attempts failed. Last error: {last_error}")
     return None
+
+
+def ask_uitars(
+    task: str,
+    screenshot_b64: str,
+    history: list[dict] | None = None,
+    session_summary: str = "",
+) -> Optional[dict]:
+    """
+    Send the current screen and task to UI-TARS via Featherless.
+
+    Args:
+        task:            The user's natural-language goal.
+        screenshot_b64:  Base64-encoded JPEG of the current screen.
+        history:         List of previous {action, observation} dicts for this task.
+        session_summary: Optional cross-task context string (L3 fix).
+
+    Returns:
+        Parsed action dict, e.g. {"type": "click", "point": [640, 400]}
+        Returns None on unrecoverable failure.
+    """
+    history = history or []
+    messages = _build_messages(task, screenshot_b64, history, session_summary)
+    raw_text = _featherless_post(messages, max_tokens=256, temperature=0.0)
+    if raw_text is None:
+        return None
+    print(f"[brain] UI-TARS raw response: {raw_text}")
+    return _parse_action(raw_text)
 
 
 # ── Screen description (Phase 4) ───────────────────────────────────────────
@@ -183,11 +224,6 @@ def describe_screen(screenshot_b64: str, user_query: str = "Read the screen") ->
     Returns:
         Plain text description suitable for TTS, or None on failure.
     """
-    url = f"{FEATHERLESS_BASE_URL}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {get_api_key()}",
-        "Content-Type": "application/json",
-    }
     messages = [
         {"role": "system", "content": READ_SCREEN_PROMPT},
         {
@@ -207,41 +243,12 @@ def describe_screen(screenshot_b64: str, user_query: str = "Read the screen") ->
             ],
         },
     ]
-    payload = {
-        "model": FEATHERLESS_MODEL,
-        "messages": messages,
-        "max_tokens": 400,
-        "temperature": 0.2,
-    }
-
-    last_error: Optional[Exception] = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = requests.post(
-                url, headers=headers, json=payload, timeout=API_TIMEOUT_SECONDS
-            )
-            response.raise_for_status()
-            data = response.json()
-            desc = data["choices"][0]["message"]["content"].strip()
-            print(f"[brain] Screen description: {desc[:100]}...")
-            return desc
-        except requests.exceptions.Timeout:
-            last_error = TimeoutError(f"API timed out after {API_TIMEOUT_SECONDS}s")
-        except requests.exceptions.HTTPError as e:
-            last_error = e
-            if response.status_code != 429 and response.status_code < 500:
-                print(f"[brain] describe_screen API error {response.status_code}")
-                return None
-        except Exception as e:
-            last_error = e
-
-        if attempt < MAX_RETRIES:
-            wait = 2 ** attempt
-            print(f"[brain] describe_screen attempt {attempt} failed. Retrying in {wait}s…")
-            time.sleep(wait)
-
-    print(f"[brain] describe_screen failed after {MAX_RETRIES} attempts: {last_error}")
-    return None
+    desc = _featherless_post(messages, max_tokens=400, temperature=0.2)
+    if desc:
+        print(f"[brain] Screen description: {desc[:100]}...")
+    else:
+        print("[brain] describe_screen failed after all retries.")
+    return desc
 
 
 # ── Action parser ──────────────────────────────────────────────────────────
@@ -252,6 +259,25 @@ ALLOWED_ACTIONS = {
     'hotkey', 'scroll', 'move', 'open_app', 'switch_window',
     'wait', 'done', 'fail',
 }
+
+
+def _pixels_to_pct(x_px: float, y_px: float) -> tuple:
+    """
+    Convert absolute pixel coordinates to 0-100% percentages.
+    Uses pyautogui.size() for the current screen resolution.
+    Falls back to 1920x1080 if pyautogui is unavailable.
+    """
+    try:
+        import pyautogui as _pag
+        sw, sh = _pag.size()
+    except Exception:
+        sw, sh = 1920, 1080   # Safe fallback for most laptops
+    x_pct = round((x_px / sw) * 100, 2)
+    y_pct = round((y_px / sh) * 100, 2)
+    # Clamp to valid range
+    x_pct = max(0.0, min(100.0, x_pct))
+    y_pct = max(0.0, min(100.0, y_pct))
+    return x_pct, y_pct
 
 
 def _parse_action(raw: str) -> Optional[dict]:
@@ -302,12 +328,22 @@ def _parse_action(raw: str) -> Optional[dict]:
             y_val = ((ymin + ymax) / 2.0) / 10.0
             result["point"] = [round(x_val, 2), round(y_val, 2)]
         else:
-            # 2-coordinate form: (x, y) scaled 0-1000 → 0-100%.
+            # 2-coordinate form: (x, y).
+            # UI-TARS uses 0-1000 scale, but occasionally outputs actual pixel
+            # coordinates (e.g. on high-DPI displays or certain screen sizes).
+            # Detect which scale is being used and convert accordingly.
             box2_m = re.search(r"\(([0-9]+),([0-9]+)\)", args_str)
             if box2_m:
-                x_val = float(box2_m.group(1)) / 10.0
-                y_val = float(box2_m.group(2)) / 10.0
-                result["point"] = [round(x_val, 2), round(y_val, 2)]
+                x_raw = float(box2_m.group(1))
+                y_raw = float(box2_m.group(2))
+                # Try 0-1000 scale first (divide by 10 → 0-100%)
+                x_pct = x_raw / 10.0
+                y_pct = y_raw / 10.0
+                if x_pct > 100 or y_pct > 100:
+                    # Values exceed 100% → they are pixel coordinates.
+                    # Convert to percentage using actual screen size.
+                    x_pct, y_pct = _pixels_to_pct(x_raw, y_raw)
+                result["point"] = [round(x_pct, 2), round(y_pct, 2)]
 
     # Extract text='...'
     text_m = re.search(r"text=['\"](.+?)['\"](?=\s*[,)]|$)", args_str, re.DOTALL)
@@ -315,12 +351,12 @@ def _parse_action(raw: str) -> Optional[dict]:
         result["text"] = text_m.group(1)
 
     # Extract key='...'
-    key_m = re.search(r"key=['\"](.+?)['\"]", args_str)
+    key_m = re.search(r"key=['\"](.+?)['\"]\s*(?=[,)]|$)", args_str)
     if key_m:
         result["key"] = key_m.group(1)
 
     # Extract keys='...' (hotkey)
-    keys_m = re.search(r"keys=['\"](.+?)['\"]", args_str)
+    keys_m = re.search(r"keys=['\"](.+?)['\"]\s*(?=[,)]|$)", args_str)
     if keys_m:
         result["keys"] = keys_m.group(1)
 
@@ -341,7 +377,7 @@ def _parse_action(raw: str) -> Optional[dict]:
 
     # Extract message/reason/name
     for field in ("message", "reason", "name"):
-        fld_m = re.search(rf"{field}=['\"](.+?)['\"]", args_str, re.DOTALL)
+        fld_m = re.search(rf"{field}=['\"](.+?)['\"]\s*(?=[,)]|$)", args_str, re.DOTALL)
         if fld_m:
             result[field] = fld_m.group(1)
 

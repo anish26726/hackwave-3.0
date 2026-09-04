@@ -43,7 +43,7 @@ class WakeWordDetector:
     def __init__(
         self,
         wake_words: Optional[set] = None,
-        chunk_duration: float = 3.0,   # seconds to listen per chunk
+        chunk_duration: float = 2.0,   # seconds to listen per chunk (was 3.0)
     ):
         self.wake_words = wake_words or DEFAULT_WAKE_WORDS
         self.chunk_duration = chunk_duration
@@ -120,7 +120,10 @@ class WakeWordDetector:
         """Listen for one short audio chunk and return transcription or None."""
         try:
             with sr.Microphone() as source:
-                self.recognizer.adjust_for_ambient_noise(source, duration=0.2)
+                # B5 fix: removed per-chunk adjust_for_ambient_noise()
+                # It added a 200 ms dead-zone before every chunk and caused
+                # the detector to miss fast wake words.
+                # dynamic_energy_threshold=True handles noise adaptation instead.
                 audio = self.recognizer.listen(
                     source,
                     timeout=None,                       # wait as long as needed

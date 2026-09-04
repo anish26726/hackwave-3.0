@@ -14,13 +14,25 @@ import ctypes.wintypes
 from typing import Optional
 from PIL import Image
 
+from config.settings import TESSERACT_CMD
+
+# ── Tesseract OCR setup (B7 fix: print warning at import if unavailable) ──
 try:
     import pytesseract
+    # Apply custom binary path from settings if provided (L5 fix)
+    if TESSERACT_CMD:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
     # Quick probe — will raise if Tesseract engine binary is missing
     pytesseract.get_tesseract_version()
     _TESSERACT_AVAILABLE = True
-except Exception:
+except Exception as _tess_err:
     _TESSERACT_AVAILABLE = False
+    print(
+        f"[reader] Tesseract OCR not available ({_tess_err}).\n"
+        "  -> Screen text extraction (OCR) will be skipped.\n"
+        "  -> Install from: https://github.com/UB-Mannheim/tesseract/wiki\n"
+        "  -> After installing, add Tesseract to PATH or set TESSERACT_CMD in .env"
+    )
 
 try:
     import pygetwindow as gw
@@ -64,9 +76,11 @@ def get_open_windows() -> list[str]:
 def ocr_image(pil_image: Image.Image) -> Optional[str]:
     """
     Run Tesseract OCR on *pil_image*.
-    Returns cleaned text or None if Tesseract is not available.
+    Returns cleaned text or None if Tesseract is not available or image is None.
     """
     if not _TESSERACT_AVAILABLE:
+        return None
+    if pil_image is None:           # B3 fix: guard against None image
         return None
     try:
         # PSM 6 = assume a single uniform block of text (good for full-screen)
@@ -102,7 +116,7 @@ class ScreenReader:
 
     def read(
         self,
-        screenshot_pil: Image.Image,
+        screenshot_pil: Optional[Image.Image],
         screenshot_b64: str,
         user_query: str = "Read the screen",
     ) -> str:
@@ -110,7 +124,7 @@ class ScreenReader:
         Produce an organised, human-readable description of the current screen.
 
         1. Window context (what app is open)
-        2. OCR text (raw visible characters)
+        2. OCR text (raw visible characters)  — skipped if pil_image is None
         3. UI-TARS vision description (layout, buttons, context)
 
         Returns a single string suitable for TTS and display.
@@ -123,14 +137,18 @@ class ScreenReader:
             sections.append(f"Active window: {title}")
 
         # 2 — OCR: extract raw visible text
-        ocr_text = ocr_image(screenshot_pil)
-        if ocr_text and len(ocr_text) > 10:
-            sections.append("Visible text:\n" + ocr_text)
-        elif not _TESSERACT_AVAILABLE:
-            sections.append(
-                "(Tip: install Tesseract OCR for full text extraction — "
-                "see https://github.com/UB-Mannheim/tesseract/wiki)"
-            )
+        # B3 fix: ocr_image() now guards against None internally; also checked here
+        if screenshot_pil is not None:
+            ocr_text = ocr_image(screenshot_pil)
+            if ocr_text and len(ocr_text) > 10:
+                sections.append("Visible text:\n" + ocr_text)
+            elif not _TESSERACT_AVAILABLE:
+                sections.append(
+                    "(Tip: install Tesseract OCR for full text extraction — "
+                    "see https://github.com/UB-Mannheim/tesseract/wiki)"
+                )
+        else:
+            print("[reader] PIL image unavailable; skipping OCR.")
 
         # 3 — UI-TARS vision: contextual understanding
         vision = self._uitars_description(screenshot_b64, user_query)
@@ -158,7 +176,8 @@ class ScreenReader:
 
 # ── Intent detection ──────────────────────────────────────────────────────
 
-# Keywords that indicate the user wants the screen READ rather than an action.
+# Exact phrases that unambiguously mean "read the screen".
+# These are matched before the broader regex below.
 _READ_TRIGGERS = {
     "read my screen", "read the screen", "read this page", "read this",
     "read the page", "what's on my screen", "what is on my screen",
@@ -169,8 +188,13 @@ _READ_TRIGGERS = {
     "screen reader", "read screen",
 }
 
+# L7 fix: tighter regex to avoid mis-routing action commands like
+# "click the read button" or "describe the download process".
+# We require a clear screen/page/window/error context word alongside
+# read/describe/what's keywords.
 _READ_PATTERNS = re.compile(
-    r'\b(read|describe|what(?:\'s| is) (on|the)|tell me what)\b',
+    r'\b(read|describe)\s+(my\s+)?(screen|page|window|error|content|text|this)\b'
+    r'|what(?:\'s| is)\s+(on|the|in)?\s*(my\s+)?(screen|display|window)\b',
     re.IGNORECASE,
 )
 
@@ -179,7 +203,9 @@ def is_screen_read_command(text: str) -> bool:
     """
     Return True if *text* is a screen-reading request (not a computer action).
 
-    Checks exact phrase matches first, then regex patterns.
+    Checks exact phrase matches first (fast path), then stricter regex patterns.
+    L7 fix: regex is now tighter to avoid mis-routing action commands that
+    happen to contain "read" or "describe".
     """
     t = text.lower().strip()
     if any(trigger in t for trigger in _READ_TRIGGERS):

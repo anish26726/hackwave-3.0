@@ -9,12 +9,13 @@ import base64
 from PIL import Image, ImageGrab
 import mss
 
-from config.settings import SCREENSHOT_QUALITY, MAX_IMAGE_WIDTH
+from config.settings import SCREENSHOT_QUALITY, MAX_IMAGE_WIDTH, MONITOR_INDEX
 
 
 def capture_screen() -> str:
     """
-    Capture the primary monitor and return a base64-encoded JPEG string.
+    Capture the monitor specified by MONITOR_INDEX and return a
+    base64-encoded JPEG string.
 
     Returns:
         str: Base64-encoded JPEG image data (no data URI prefix).
@@ -28,7 +29,12 @@ def capture_screen() -> str:
     # Method 1: mss (fast, low overhead)
     try:
         with mss.mss() as sct:
-            monitor = sct.monitors[1]  # Primary monitor
+            # L6 fix: respect MONITOR_INDEX from settings (default 1 = primary)
+            monitors = sct.monitors
+            idx = min(MONITOR_INDEX, len(monitors) - 1)  # clamp to valid range
+            if idx < 1:
+                idx = 1
+            monitor = monitors[idx]
             raw = sct.grab(monitor)
             img = Image.frombytes('RGB', raw.size, raw.bgra, 'raw', 'BGRX')
     except Exception as e:
@@ -60,10 +66,14 @@ def capture_screen() -> str:
 
 
 def get_screen_size() -> tuple:
-    """Return (width, height) of the primary monitor."""
+    """Return (width, height) of the monitor specified by MONITOR_INDEX."""
     try:
         with mss.mss() as sct:
-            m = sct.monitors[1]
+            monitors = sct.monitors
+            idx = min(MONITOR_INDEX, len(monitors) - 1)
+            if idx < 1:
+                idx = 1
+            m = monitors[idx]
             return m['width'], m['height']
     except Exception:
         # Fallback using Pillow

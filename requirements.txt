@@ -7,7 +7,22 @@ requests
 python-dotenv
 SpeechRecognition
 pyaudio
-pyttsx3
 pytesseract
 keyboard
 comtypes
+pypdf
+
+# ── Optional: Offline speech-to-text (no internet required) ──────────────────
+# Uncomment the line below and run: pip install openai-whisper
+# openai-whisper
+
+# ── Optional: Tesseract OCR binary (required for screen text extraction) ──────
+# Download installer from: https://github.com/UB-Mannheim/tesseract/wiki
+# After installing, add Tesseract to your PATH or set TESSERACT_CMD in .env
+# ── Optional: Offline speech-to-text (no internet required) ──────────────────
+# Uncomment the line below and run: pip install openai-whisper
+# openai-whisper
+
+# ── Optional: Tesseract OCR binary (required for screen text extraction) ──────
+# Download installer from: https://github.com/UB-Mannheim/tesseract/wiki
+# After installing, add Tesseract to your PATH or set TESSERACT_CMD in .env

@@ -4,6 +4,7 @@
 # shell API — NO subprocess, shell, eval, exec, or os.system.
 
 import os
+import json
 import time
 import pyautogui
 
@@ -51,7 +52,8 @@ APP_ALLOW_LIST: dict[str, object] = {
     "paint":           "mspaint.exe",
     "task manager":    "taskmgr.exe",
     "settings":        "ms-settings:",
-    "cmd":             "cmd.exe",           # Controlled launch only
+    # NOTE: cmd.exe / powershell intentionally omitted — opening a shell would
+    # allow typed commands to bypass the safety layer entirely.
     "terminal":        "wt.exe",
     "vs code": [
         r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe",
@@ -61,7 +63,41 @@ APP_ALLOW_LIST: dict[str, object] = {
         r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe",
         r"C:\Program Files\Microsoft VS Code\Code.exe",
     ],
+    "visual studio code": [
+        r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe",
+        r"C:\Program Files\Microsoft VS Code\Code.exe",
+    ],
 }
+
+
+def _load_extra_apps() -> dict:
+    """
+    Load additional app entries from apps.json in the project root (L4 fix).
+    This lets users extend the allow-list without modifying source code.
+
+    apps.json format:
+        {
+            "spotify": "%LOCALAPPDATA%\\Spotify\\Spotify.exe",
+            "slack":   "C:\\Program Files\\Slack\\slack.exe"
+        }
+    """
+    apps_file = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), '..', 'apps.json')
+    )
+    if not os.path.isfile(apps_file):
+        return {}
+    try:
+        with open(apps_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        # Strip _comment keys so users can annotate their JSON
+        return {k: v for k, v in data.items() if not k.startswith('_')}
+    except Exception as e:
+        print(f"[executor] Could not load apps.json: {e}")
+        return {}
+
+
+# Merge custom apps at import time (user additions win for same key)
+APP_ALLOW_LIST.update(_load_extra_apps())
 
 
 def execute_action(action: dict) -> str:

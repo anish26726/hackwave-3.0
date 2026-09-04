@@ -17,3 +17,10 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+
+# User-defined custom app list (may contain personal paths)
+# Keep apps.json locally — do not commit it
+apps.json
+
+# Temporary files
+*.tmp

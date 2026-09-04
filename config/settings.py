@@ -41,3 +41,17 @@ MAX_RETRIES: int = 3                  # Retry limit for API calls
 # ── Screen capture ─────────────────────────────────────────────────────────
 SCREENSHOT_QUALITY: int = 85          # JPEG quality for screenshots sent to API (1-95)
 MAX_IMAGE_WIDTH: int = 1280           # Resize large screens before sending
+
+# ── Multi-monitor support (L6 fix) ─────────────────────────────────────────
+# 1 = primary monitor, 2 = second monitor, etc.
+# Set MONITOR_INDEX in .env to capture a different monitor.
+MONITOR_INDEX: int = int(os.environ.get('MONITOR_INDEX', '1'))
+
+# ── Session context (L3 fix) ───────────────────────────────────────────────
+# How many past task results to keep in session memory for follow-up commands.
+SESSION_CONTEXT_SIZE: int = int(os.environ.get('SESSION_CONTEXT_SIZE', '5'))
+
+# ── Tesseract OCR (L5) ─────────────────────────────────────────────────────
+# Optional: set TESSERACT_CMD in .env if Tesseract is not on your PATH.
+# Example: TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
+TESSERACT_CMD: str = os.environ.get('TESSERACT_CMD', '')

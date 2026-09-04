@@ -1,8 +1,14 @@
 # AccessOS — Speech-to-Text (STT)
-# Uses the SpeechRecognition library with Google Web Speech API.
-# Modular: swap _transcribe() to use Whisper, Azure, or another provider.
+# Modular STT with three backends in priority order:
+#   1. Google Web Speech API (online, high accuracy)
+#   2. Local Whisper model (offline, good accuracy — requires: pip install openai-whisper)
+#   3. CMU Sphinx (offline, basic accuracy — requires: pip install pocketsphinx)
+#
+# L1 fix: Whisper backend added so voice mode works fully offline.
 
+import os
 import time
+import tempfile
 from typing import Optional
 
 try:
@@ -17,13 +23,36 @@ try:
 except ImportError:
     _PYAUDIO_AVAILABLE = False
 
+# Optional: Whisper offline backend (L1 fix)
+try:
+    import whisper as _whisper_lib
+    _WHISPER_AVAILABLE = True
+except ImportError:
+    _WHISPER_AVAILABLE = False
+
+# Lazy-loaded Whisper model singleton (avoids 1–2 GB load on every call)
+_whisper_model = None
+
+
+def _get_whisper_model():
+    """Load and cache the Whisper 'base' model (≈140 MB, good accuracy/speed balance)."""
+    global _whisper_model
+    if _whisper_model is None:
+        model_name = os.environ.get('WHISPER_MODEL', 'base')
+        print(f"[STT] Loading Whisper '{model_name}' model (first run may take a moment)…")
+        _whisper_model = _whisper_lib.load_model(model_name)
+        print("[STT] Whisper model ready.")
+    return _whisper_model
+
 
 class STT:
     """
     Speech-to-Text using the SpeechRecognition library.
 
-    Primary backend: Google Web Speech API (requires internet).
-    Fallback:        CMU Sphinx (offline, lower accuracy) if installed.
+    Backend priority:
+        1. Google Web Speech API (online, ~high accuracy)
+        2. Local Whisper model   (offline, ~good accuracy — pip install openai-whisper)
+        3. CMU Sphinx            (offline, ~basic accuracy)
 
     Usage:
         stt = STT()
@@ -56,6 +85,13 @@ class STT:
         self.recognizer.energy_threshold = energy_threshold
         self.recognizer.dynamic_energy_threshold = True
         self.recognizer.pause_threshold = 0.8   # seconds of silence = end of phrase
+
+        # Report available backends at startup
+        backends = ["Google Web Speech (online)"]
+        if _WHISPER_AVAILABLE:
+            backends.append("Whisper (offline)")
+        backends.append("Sphinx (offline, if installed)")
+        print(f"[STT] Available backends: {', '.join(backends)}")
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -114,26 +150,68 @@ class STT:
     # ── Backend ───────────────────────────────────────────────────────────
 
     def _transcribe(self, audio) -> Optional[str]:
-        """Transcribe audio. Tries Google first, then Sphinx offline."""
-        # Primary: Google Web Speech API
+        """
+        Transcribe audio using available backends in priority order:
+            1. Google Web Speech (online)
+            2. Whisper (offline, if openai-whisper installed)
+            3. Sphinx  (offline, if pocketsphinx installed)
+        """
+        # ── Backend 1: Google Web Speech API ──────────────────────────────
         try:
             text = self.recognizer.recognize_google(audio)
-            print(f"[STT] Heard: {text!r}")
+            print(f"[STT] (Google) Heard: {text!r}")
             return text.strip()
         except sr.UnknownValueError:
             print("[STT] Could not understand audio.")
             return None
         except sr.RequestError as e:
-            print(f"[STT] Google STT unavailable ({e}). Trying offline...")
+            print(f"[STT] Google STT unavailable ({e}). Trying offline backend…")
 
-        # Fallback: CMU Sphinx (offline) — only if installed
+        # ── Backend 2: Whisper (offline) — L1 fix ─────────────────────────
+        if _WHISPER_AVAILABLE:
+            result = self._transcribe_whisper(audio)
+            if result:
+                return result
+            print("[STT] Whisper failed. Trying Sphinx…")
+
+        # ── Backend 3: CMU Sphinx (offline fallback) ─────────────────────
         try:
             text = self.recognizer.recognize_sphinx(audio)
             print(f"[STT] (Sphinx) Heard: {text!r}")
             return text.strip()
         except Exception:
-            print("[STT] All transcription methods failed.")
+            pass
+
+        print("[STT] All transcription backends failed.")
+        return None
+
+    def _transcribe_whisper(self, audio) -> Optional[str]:
+        """
+        Transcribe using the local Whisper model (offline, no internet required).
+        Saves audio to a temporary WAV file, then runs Whisper on it.
+        """
+        tmp_path = None
+        try:
+            model = _get_whisper_model()
+            # Write audio to a temporary WAV file
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                f.write(audio.get_wav_data())
+                tmp_path = f.name
+            result = model.transcribe(tmp_path, language='en', fp16=False)
+            text = result.get('text', '').strip()
+            if text:
+                print(f"[STT] (Whisper) Heard: {text!r}")
+                return text
             return None
+        except Exception as e:
+            print(f"[STT] Whisper error: {e}")
+            return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────
