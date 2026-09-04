@@ -37,6 +37,7 @@ MAX_ACTIONS_PER_TASK: int = 30        # Hard cap per task to prevent infinite lo
 ACTION_TIMEOUT_SECONDS: int = 10      # Seconds to wait before an action times out
 API_TIMEOUT_SECONDS: int = 60         # HTTP timeout for Featherless API calls
 MAX_RETRIES: int = 3                  # Retry limit for API calls
+TASK_TIMEOUT_SECONDS: int = int(os.environ.get('TASK_TIMEOUT_SECONDS', '300'))  # Phase 8: wall-clock cap
 
 # ── Screen capture ─────────────────────────────────────────────────────────
 SCREENSHOT_QUALITY: int = 85          # JPEG quality for screenshots sent to API (1-95)

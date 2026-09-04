@@ -1,27 +1,24 @@
-# AccessOS -- Main Entry Point (Phase 6)
-# Core loop:
-#   Text input  -> Screenshot -> UI-TARS -> Validate -> Safety Check
-#   -> Execute  -> Verify -> Anti-repetition -> Repeat
-#
-# Voice mode (Phase 3):
-#   Wake word -> STT -> run_task() -> TTS response
-# Screen reader (Phase 4):
-#   Read command -> Screenshot -> OCR + UI-TARS -> Organised text -> TTS
-# File operations (Phase 5):
-#   File command -> Intent parser -> FileHandler -> Safety check -> Execute -> TTS
-# Browser automation (Phase 6):
-#   Browser command -> Intent parser -> BrowserHandler -> Execute -> DOM read -> TTS
+# AccessOS -- Main Entry Point (Phase 8)
+# Safety pipeline:
+#   LLM intent → Content safety check → Route to handler
+#   UI-TARS action → check_action → is_sensitive (confirm) → validate → execute
+#   Screen/web text → check_content_safety → sanitize → model
+#   File delete → confirm_sensitive_action (always required)
 
 import sys
 import time
+import threading
 import pyautogui
 
-from config.settings import MAX_ACTIONS_PER_TASK, SESSION_CONTEXT_SIZE
+from config.settings import MAX_ACTIONS_PER_TASK, SESSION_CONTEXT_SIZE, TASK_TIMEOUT_SECONDS
 from screen.capture import capture_screen
 from agent.brain import ask_uitars
 from computer.validator import validate_action
 from computer.executor import execute_action
-from safety.guard import check_action, is_sensitive
+from safety.guard import (
+    check_action, is_sensitive,
+    check_content_safety, sanitize_content, confirm_sensitive_action,
+)
 
 # -- Phase 3: Voice modules ---------------------------------------------------
 try:
@@ -246,10 +243,23 @@ def run_task(task: str) -> str:
     action_count = 0
     consecutive_repeats = 0
     last_raw_action = None
+    task_start_time = time.time()   # Phase 8: wall-clock timeout
 
     while action_count < MAX_ACTIONS_PER_TASK:
         if STOP_REQUESTED:
             result = "Task cancelled by user."
+            _session.add(task, result)
+            return result
+
+        # Phase 8: wall-clock timeout guard
+        elapsed = time.time() - task_start_time
+        if elapsed > TASK_TIMEOUT_SECONDS:
+            result = (
+                f"Task timed out after {int(elapsed)}s "
+                f"(limit: {TASK_TIMEOUT_SECONDS}s). "
+                "Increase TASK_TIMEOUT_SECONDS in .env if needed."
+            )
+            print(f"[loop] ⏱ {result}")
             _session.add(task, result)
             return result
 
@@ -959,6 +969,11 @@ def _execute_intent(intent: dict, original_task: str, tts=None) -> str:
                     if reader.is_available():
                         dom_text = reader.get_page_text()
                         if dom_text and len(dom_text.strip()) > 50:
+                            # Phase 8: content safety — sanitize webpage text before model
+                            safe, warn = check_content_safety(dom_text)
+                            if not safe:
+                                print(f"[safety] {warn}")
+                                dom_text = sanitize_content(dom_text)
                             print("[intent] Using DOM text + Qwen2.5 for webpage summary")
                             summary = summarize_text(dom_text, context=original_task)
                             _session.add(original_task, summary[:200])
@@ -975,6 +990,11 @@ def _execute_intent(intent: dict, original_task: str, tts=None) -> str:
                     screenshot = capture_screen()
                     print("[intent] Using Qwen2-VL for screen description")
                     summary = summarize_screen(screenshot, context=original_task)
+                    # Phase 8: safety check on the AI-generated description text
+                    safe, warn = check_content_safety(summary)
+                    if not safe:
+                        print(f"[safety] Injection detected in screen content: {warn}")
+                        summary = sanitize_content(summary)
                     _session.add(original_task, summary[:200])
                     if tts:
                         tts.speak(summary)
@@ -1051,8 +1071,20 @@ def _execute_intent(intent: dict, original_task: str, tts=None) -> str:
         elif intent_type == "file":
             if not _FILES_AVAILABLE:
                 return "File module not available."
-            # Inject filename/path back into task string so run_file_command parses it
-            # This reuses the existing FileHandler without duplication
+
+            # Phase 8: delete/remove always requires explicit confirmation
+            file_op = intent.get("op", "")
+            if file_op in ("delete", "remove"):
+                filename = intent.get("filename", "this file")
+                allowed  = confirm_sensitive_action(
+                    reason=f"This will permanently delete '{filename}'. This cannot be undone.",
+                    action_description=f"Delete: {filename}",
+                    tts=tts,
+                )
+                if not allowed:
+                    return f"Delete cancelled — '{filename}' was NOT deleted."
+
+            # Reuse the existing FileHandler without duplication
             return run_file_command(original_task, tts=tts)
 
         # ── General: visual task → UI-TARS screenshot loop ────────────────
